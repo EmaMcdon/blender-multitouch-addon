@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 15, 1),
+    "version": (3, 15, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1762,6 +1762,7 @@ class RawTouchCounter:
         self._prep = {}           # hDevice -> preparsed data buffer
         self._slot_cache = {}     # hDevice -> finger slots
         self.last_t = 0.0         # perf_counter of the last report
+        self.silent_downs = 0     # touches in a row that Windows saw but raw input didn't
         self.gesture = None       # current raw touch: t0, t_last, maxc, pts{id: [x0,y0,x,y]}, rng
         self._buf = ctypes.create_string_buffer(8192)
         # --- Raw mode (emitting finger events) ---
@@ -2338,8 +2339,13 @@ class TouchHook:
                                 is_up = m in (WM_POINTERUP, WM_POINTERLEAVE) or bool(flags & POINTER_FLAG_UP)
                                 if raw.emit:
                                     landing = is_down and not is_up
-                                    if landing and time.perf_counter() - raw.last_t > 0.5:
-                                        # Windows has a finger but the raw stream is silent:
+                                    silent = landing and time.perf_counter() - raw.last_t > 0.5
+                                    if landing:
+                                        # The first touch after a start can reach Windows just
+                                        # before its raw report: only a second silent one counts.
+                                        raw.silent_downs = raw.silent_downs + 1 if silent else 0
+                                    if silent and raw.silent_downs >= 2:
+                                        # Windows has fingers but the raw stream stays silent:
                                         # this screen's raw data isn't usable. Fall back.
                                         raw.emit = False
                                         raw.fell_back = True
