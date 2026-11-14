@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 14, 1),
+    "version": (3, 14, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -3346,7 +3346,7 @@ if bpy is not None:
             description="Arm timeout: keep rejecting touches on the pen hand's side for this "
                         "long after the pen was last near the screen (ms). Your arm rests on "
                         "the screen between strokes, while the pen is lifted",
-            default=1500, min=0, max=5000,
+            default=200, min=0, max=5000,
         )
         zoom_speed: bpy.props.FloatProperty(
             name="Pinch Zoom Speed",
