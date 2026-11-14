@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 15, 2),
+    "version": (3, 15, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -2510,6 +2510,7 @@ if bpy is not None:
             self._hold_edit = None
             self._rest_cursor = get_cursor()   # where Blender thinks the cursor is
             self._restore_cursor = None
+            self._popup_click = None     # [x, y, ticks left]: tap on a menu, cursor moved first
             self._touching = False
             self._raw_block = False      # 3+ fingers on the glass: ignore pointer gestures
             self._raw_last = None        # (finished raw touch, perf_counter when finished)
@@ -2568,6 +2569,13 @@ if bpy is not None:
                 self._raw_fallback_reported = True
                 _log_info("raw touch data stopped arriving: switched to Windows touch input")
                 self.report({'WARNING'}, "Multitouch: raw touch input not usable, using Windows input")
+            pc = self._popup_click
+            if pc is not None:
+                pc[2] -= 1
+                if pc[2] <= 0:
+                    self._popup_click = None
+                    inject_button('LEFT', True, pc[0], pc[1])
+                    inject_button('LEFT', False, pc[0], pc[1])
             events = self._hook.drain()
             if events:
                 self._last_touch = (events[-1][1], events[-1][2])
@@ -3167,8 +3175,11 @@ if bpy is not None:
                     return
                 x, y = self._amap(a[1], a[2])
                 if popup_under(context, x, y) is not None:
-                    inject_button('LEFT', True, x, y)     # open menu / F3 search: click it
-                    inject_button('LEFT', False, x, y)
+                    # Open menu / F3 search: move there first and click on a later tick.
+                    # Blender only takes a click on an item it has already seen the cursor
+                    # over; a submenu ignores a click that arrives with the jump.
+                    inject_move(x, y)
+                    self._popup_click = [x, y, 2]
                     return
                 target = find_target(context, x, y)
                 if target is None:
