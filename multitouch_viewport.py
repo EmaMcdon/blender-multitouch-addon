@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 14, 3),
+    "version": (3, 14, 7),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -2929,8 +2929,9 @@ if bpy is not None:
                 eng.hold_time = HOLD_TIME_S
                 eng.hold_preview = HOLD_PREVIEW_S
                 eng.hold_slop = 1.0
-                if (target is not None and _numdrag_region(target[1], target[2])
-                        and not other_modal_running(context)):
+                if (target is not None and not other_modal_running(context)
+                        and (_numdrag_region(target[1], target[2])
+                             or popup_under(context, a[1], a[2]) is not None)):
                     self._ui_hold = {"down": False, "ctrl": False, "xy": (a[1], a[2]),
                                      "moved": [0.0, 0.0]}
                     self._hold_pick = ('UI', target)
@@ -3182,9 +3183,9 @@ if bpy is not None:
                 _log_info("drag at (%d,%d), system cursor at %s" % (sx, sy, get_cursor()))
                 mw = popup_under(context, sx, sy)
                 if mw is not None:
-                    ctl = _Controller('MOUSE', window=mw)   # like the mouse on a menu
-                    ctl.button = 'LEFT'
-                    inject_button('LEFT', True, sx, sy)
+                    # Open menu / search list: a drag scrolls it (wheel, one row per
+                    # notch). Hold first, then slide, to pick items like the mouse.
+                    ctl = _Controller('MENU', window=mw)
                     ctl.last_xy = (sx, sy)
                     self._ctl = ctl
                     return
@@ -3254,6 +3255,14 @@ if bpy is not None:
                 elif ctl.kind == 'NUMDRAG':
                     numdrag_move(ctl, dx, dy)
                     return
+                elif ctl.kind == 'MENU':
+                    row = 20.0 * _ui_scale()
+                    ctl.wheel += dy
+                    n = int(ctl.wheel / row)
+                    if n:
+                        ctl.wheel -= n * row
+                        # Finger down = list moves down (wheel down).
+                        post_mouse_wheel(*self._amap(x, y), -n * WHEEL_DELTA)
                 else:  # MOUSE / PAN2D: the held button follows the finger
                     inject_move(*self._amap(x, y))
                 ctl.last_xy = (x, y)
