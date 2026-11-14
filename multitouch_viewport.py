@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 15, 3),
+    "version": (3, 15, 4),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -3185,8 +3185,8 @@ if bpy is not None:
                 if target is None:
                     # Top bar (workspace tabs, menus) and status bar are global areas.
                     if window_under(context, x, y) is not None:
-                        inject_button('LEFT', True, x, y)
-                        inject_button('LEFT', False, x, y)
+                        inject_move(x, y)
+                        self._popup_click = [x, y, 2]
                     return
                 _w, area, region, (rx, ry), _l = target
                 if (area.type == 'VIEW_3D' and region.type == 'WINDOW'
@@ -3200,8 +3200,15 @@ if bpy is not None:
                     inject_button('LEFT', True, x, y)
                     inject_button('LEFT', False, x, y)
                     return
-                inject_button('LEFT', True, x, y)
-                inject_button('LEFT', False, x, y)
+                if area.type == 'VIEW_3D' and region.type == 'WINDOW':
+                    inject_button('LEFT', True, x, y)    # viewport: select right away
+                    inject_button('LEFT', False, x, y)
+                    return
+                # Buttons (toolbar, panels, headers): same as menus, the cursor first.
+                # After the UI grew the cursor jumps far, and a click that comes with the
+                # jump lands on a button Blender hasn't highlighted yet and is lost.
+                inject_move(x, y)
+                self._popup_click = [x, y, 2]
 
             elif kind == 'drag_begin':
                 self._end_controller()
