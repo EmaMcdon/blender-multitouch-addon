@@ -6,7 +6,7 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 
 ## Features
 
-- **Touch navigation**: tap to click, one-finger orbit/pan/scroll, two-finger pan and pinch zoom.
+- **Touch navigation**: tap to click, one-finger orbit/pan/scroll, two-finger pan and pinch zoom, two-finger twist to roll the view (can be turned off: *Twist to Roll*).
 - **Multi-finger taps**: 2, 3 and 4 fingers do Undo, Redo and Focus Mode (configurable).
 - **Palm rejection**: touches on the pen hand's side are ignored while the pen is near and for a set time after it leaves. Right-handed, left-handed and distance modes are available.
 - **Auto-perspective**: one-finger orbit leaves the automatic orthographic view (orthographic chosen with numpad 5 is kept).

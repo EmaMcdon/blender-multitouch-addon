@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 14, 7),
+    "version": (3, 15, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -31,6 +31,7 @@ IS_WINDOWS = sys.platform.startswith("win")
 
 WHEEL_DELTA = 120
 SCROLL_PIXELS_PER_NOTCH = 30.0   # vertical drag pixels per wheel notch
+TWIST_START_RAD = math.radians(15.0)   # two-finger twist before the view starts to roll
 TAP_TIMEOUT_S = 0.5              # multi-finger tap window (same as the demo build)
 DRAG_THRESHOLD_POINTS = 5.0      # scaled by DPI / 96 (15 px at Android's 288 DPI)
 
@@ -387,6 +388,7 @@ class TouchEngine:
       ('drag', dx, dy, x, y)              one-finger motion (also after 2->1 transition)
       ('two_begin', cx, cy)               two-finger pan/pinch gesture starts
       ('two', dx, dy, zoom, cx, cy)       centroid delta + pinch ratio (>1 = spread)
+      ('twist', dang, cx, cy)             two-finger rotation (radians, + = clockwise)
       ('two_to_one', x, y)                one finger lifted, the other keeps navigating
       ('multi_tap', n, cx, cy)            2/3/4-finger tap
       ('end',)                            current gesture finished or was suppressed
@@ -458,6 +460,7 @@ class TouchEngine:
         self.mode = mode
         self.start = self.prev = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5)
         self.prev_dist = math.hypot(b[0] - a[0], b[1] - a[1])
+        self.prev_angle = math.atan2(b[1] - a[1], b[0] - a[0])
 
     def _tap_valid(self, t):
         if t - self.tap_t0 > self.tap_timeout:
@@ -577,8 +580,13 @@ class TouchEngine:
             zoom = dist / self.prev_dist if self.prev_dist > 1e-3 else 1.0
             if dx or dy or abs(zoom - 1.0) > 1e-6:
                 out.append(('two', dx, dy, zoom, c[0], c[1]))
+            ang = math.atan2(b[1] - a[1], b[0] - a[0])
+            dang = _wrap_angle(ang - self.prev_angle)
+            if abs(dang) > 1e-6:
+                out.append(('twist', dang, c[0], c[1]))
             self.prev = c
             self.prev_dist = dist
+            self.prev_angle = ang
         return out
 
     def up(self, pid, x, y, t, canceled=False):
@@ -2417,7 +2425,7 @@ _TAP_ACTIONS = [
 class _Controller:
     """The thing a running gesture is driving (one per gesture)."""
     __slots__ = ("kind", "window", "area", "region", "rv3d", "button", "wheel", "wheel_x", "last_xy",
-                 "anchor", "start", "acc", "decided", "keys", "fxy")
+                 "anchor", "start", "acc", "decided", "keys", "fxy", "twist")
 
     def __init__(self, kind, area=None, region=None, rv3d=None, window=None):
         self.kind = kind
@@ -2435,6 +2443,7 @@ class _Controller:
         self.decided = True
         self.keys = []       # modifier keys held for this gesture
         self.fxy = None      # first finger's last position (number drags follow only it)
+        self.twist = 0.0     # two-finger rotation so far; rolls the view once past a threshold
 
 
 # Main regions that aren't View2D: they still scroll with the mouse wheel (which is
@@ -3114,7 +3123,7 @@ if bpy is not None:
                         self._restore_cursor = rest
                         _log("BUSY: 2-finger tap -> cancel")
                     return
-                if kind in ('two_begin', 'two', 'two_to_one'):
+                if kind in ('two_begin', 'two', 'twist', 'two_to_one'):
                     return
                 if kind == 'tap':
                     self._end_controller()
@@ -3322,6 +3331,23 @@ if bpy is not None:
                     self._scroll(ctl, dy, cx, cy, dx)
                 ctl.last_xy = (cx, cy)
 
+            elif kind == 'twist':
+                ctl = self._ctl
+                if (ctl is None or ctl.kind != 'VIEW3D' or ctl.rv3d is None
+                        or not props.twist_roll):
+                    return
+                dang = a[1]
+                if abs(ctl.twist) < TWIST_START_RAD:
+                    ctl.twist += dang       # pinches wobble a little: roll only on a real twist
+                    if abs(ctl.twist) < TWIST_START_RAD:
+                        return
+                    _log_info("twist: rolling the view")
+                    return
+                rv3d = ctl.rv3d
+                rv3d.view_rotation = (rv3d.view_rotation
+                                      @ Quaternion((0.0, 0.0, 1.0), dang)).normalized()
+                ctl.area.tag_redraw()
+
             elif kind == 'two_to_one':
                 ctl = self._ctl
                 if ctl is None:
@@ -3433,6 +3459,12 @@ if bpy is not None:
                         "the finger spread exactly, lower = slower)",
             default=0.75, min=0.1, max=1.5, step=5, precision=2,
         )
+        twist_roll: bpy.props.BoolProperty(
+            name="Twist to Roll",
+            description="Twisting two fingers rolls the 3D View (turns it clockwise / "
+                        "counter-clockwise on screen)",
+            default=True,
+        )
         tap2_action: bpy.props.EnumProperty(name="2-Finger Tap", items=_TAP_ACTIONS, default='UNDO')
         tap3_action: bpy.props.EnumProperty(name="3-Finger Tap", items=_TAP_ACTIONS, default='REDO')
         tap4_action: bpy.props.EnumProperty(name="4-Finger Tap", items=_TAP_ACTIONS, default='FOCUS')
@@ -3496,6 +3528,7 @@ if bpy is not None:
                 elif props.touch_source == 'RAW':
                     layout.label(text="Raw unavailable: using Windows", icon='INFO')
             layout.prop(props, "zoom_speed", slider=True)
+            layout.prop(props, "twist_roll")
             layout.prop(props, "scroll_fingers", expand=True)
             layout.prop(props, "pen_only_paint")
             box = layout.box()
