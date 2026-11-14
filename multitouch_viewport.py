@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 14, 2),
+    "version": (3, 14, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1445,6 +1445,62 @@ def _ring_hide():
             pass
 
 
+# Open menus, popovers and search popups are temporary regions in the screen's
+# runtime region list (bScreen.regionbase), which Python doesn't expose. Its place in
+# the struct is found once by matching the area list next to it (areabase, whose first
+# and last entries Python does know), and the region rect by matching a known region.
+_POPUP_LAYOUT = {}
+
+
+def _popup_rects(window):
+    """Window-local (xmin, xmax, ymin, ymax) of every open menu / popup, or []."""
+    if not IS_WINDOWS:
+        return []
+    try:
+        import ctypes
+        screen = window.screen
+        areas = list(screen.areas)
+        if not areas:
+            return []
+        words = (ctypes.c_uint64 * 256).from_address(screen.as_pointer())
+        k = _POPUP_LAYOUT.get("areabase")
+        first, last = areas[0].as_pointer(), areas[-1].as_pointer()
+        if k is None or words[k] != first or words[k + 1] != last:
+            k = next((i for i in range(254) if words[i] == first and words[i + 1] == last), None)
+            if k is None:
+                return []
+            _POPUP_LAYOUT["areabase"] = k
+        r_off = _POPUP_LAYOUT.get("winrct")
+        if r_off is None:
+            ref = max((r for a in areas for r in a.regions if r.width > 1 and r.height > 1),
+                      key=lambda r: r.width * r.height)
+            ints = (ctypes.c_int32 * 512).from_address(ref.as_pointer())
+            want = (ref.x, ref.x + ref.width - 1, ref.y, ref.y + ref.height - 1)
+            r_off = next((i for i in range(4, 508) if tuple(ints[i:i + 4]) == want), None)
+            if r_off is None:
+                return []
+            _POPUP_LAYOUT["winrct"] = r_off
+        rects = []
+        reg = words[k + 2]
+        while reg and len(rects) < 16:
+            ints = (ctypes.c_int32 * (r_off + 4)).from_address(reg)
+            rects.append(tuple(ints[r_off:r_off + 4]))
+            reg = ctypes.c_uint64.from_address(reg).value      # ARegion.next
+        return rects
+    except Exception:
+        return []
+
+
+def popup_under(context, sx, sy):
+    """The window whose open menu / popup contains the screen point, or None."""
+    for window in context.window_manager.windows:
+        lx, ly = _screen_to_local(window, sx, sy)
+        for x0, x1, y0, y1 in _popup_rects(window):
+            if x0 <= lx <= x1 and y0 <= ly <= y1:
+                return window
+    return None
+
+
 def _numdrag_region(area, region):
     """Regions full of number fields: Properties editor, sidebars, redo panel, prefs."""
     if area.type in ('PROPERTIES', 'PREFERENCES'):
@@ -2720,6 +2776,8 @@ if bpy is not None:
             ap = _tui_prefs()
             if ap is None or not ap.touch_ui:
                 return
+            if popup_under(context, x, y) is not None:
+                return      # on an open menu / search popup: leave the UI size alone
             target = find_target(context, x, y)
             if target is None:
                 if window_under(context, x, y) is not None:   # top bar / status bar
@@ -3092,6 +3150,10 @@ if bpy is not None:
                     an["tap"] = a          # the UI is still growing: click when it is done
                     return
                 x, y = self._amap(a[1], a[2])
+                if popup_under(context, x, y) is not None:
+                    inject_button('LEFT', True, x, y)     # open menu / F3 search: click it
+                    inject_button('LEFT', False, x, y)
+                    return
                 target = find_target(context, x, y)
                 if target is None:
                     # Top bar (workspace tabs, menus) and status bar are global areas.
@@ -3118,6 +3180,14 @@ if bpy is not None:
                 self._end_controller()
                 sx, sy = self._amap(a[1], a[2])
                 _log_info("drag at (%d,%d), system cursor at %s" % (sx, sy, get_cursor()))
+                mw = popup_under(context, sx, sy)
+                if mw is not None:
+                    ctl = _Controller('MOUSE', window=mw)   # like the mouse on a menu
+                    ctl.button = 'LEFT'
+                    inject_button('LEFT', True, sx, sy)
+                    ctl.last_xy = (sx, sy)
+                    self._ctl = ctl
+                    return
                 target = find_target(context, sx, sy)
                 if target is None:
                     w = window_under(context, sx, sy)
