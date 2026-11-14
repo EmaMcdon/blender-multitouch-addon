@@ -26,3 +26,9 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 
 - Windows (uses the Win32 touch, pointer and raw-input APIs).
 - Blender 4.0 or newer (developed on 5.3).
+
+## Known issues
+
+- **Multi-value slide in Transform → Location only works bottom-up.** Holding X and sliding down to Z doesn't select all three fields, but sliding from Z up to X does. This is a Blender limitation: the official Android build behaves the same way. Rotation and Scale work in both directions.
+- **The arm can trigger the sidebar while sculpting.** If your arm rests on the screen after the pen leaves, the UI may grow and shrink. Raise *After Pen Leaves* in the Touch tab (for example to 2000 ms) to ignore touches on the pen side for longer.
+- **Windows only.** It uses Win32 touch and raw-input APIs, so it does nothing on macOS or Linux.
