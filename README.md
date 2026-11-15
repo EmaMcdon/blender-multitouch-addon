@@ -18,9 +18,19 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 
 ## Install
 
-1. Download `multitouch_viewport.py`.
-2. In Blender: *Edit → Preferences → Add-ons → Install from Disk…* and pick the file.
-3. Enable **Multitouch Viewport Navigation**. It starts automatically; its settings are in the 3D View sidebar, *Touch* tab.
+**As an extension (Blender 4.2 and newer):** download `multitouch_viewport-<version>.zip` and drag it into Blender, or use *Edit → Preferences → Get Extensions → ⌄ → Install from Disk…*.
+
+**As a classic add-on:** download `multitouch_viewport.py`, then *Edit → Preferences → Add-ons → Install from Disk…* and pick the file.
+
+Either way, enable **Multitouch Viewport Navigation**. It starts automatically; its settings are in the 3D View sidebar, *Touch* tab.
+
+## Building the extension zip
+
+```
+python build_extension.py "path/to/blender.exe"
+```
+
+This packs `multitouch_viewport.py` with `blender_manifest.toml` and the license, keeps the manifest version in step with the add-on, validates it and writes the zip to `dist/`.
 
 ## Requirements
 
@@ -42,3 +52,7 @@ Fixes that were tried, failed in real use and were taken out, so nobody has to t
 - **Shrinking the bigger UI back after 20 seconds without input.** It worked, but felt wrong in use, so the UI only shrinks when you touch the viewport or use the mouse or pen.
 - **Scrolling a menu by sliding onto its ▼ arrow while holding.** Blender doesn't auto-scroll a menu while the button is held, and the search lists (F3, Add Modifier → Search) never auto-scroll, so a quick one-finger drag scrolls menus instead.
 - **Two-finger scrolling in menus.** It worked, but one-finger dragging was enough, so it was removed to keep the gestures simple.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).

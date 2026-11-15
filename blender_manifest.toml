@@ -1,0 +1,22 @@
+schema_version = "1.0.0"
+
+id = "multitouch_viewport"
+# Kept in step with bl_info["version"] by build_extension.py
+version = "3.15.4"
+name = "Multitouch Viewport Navigation"
+tagline = "Touchscreen navigation and pen palm rejection on Windows"
+maintainer = "EmaMcdon"
+type = "add-on"
+website = "https://github.com/EmaMcdon/blender-multitouch-addon"
+
+tags = ["3D View", "User Interface", "Sculpt"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+# Uses the Win32 touch, pointer and raw-input APIs.
+platforms = ["windows-x64", "windows-arm64"]
+
+[permissions]
+files = "Writes a diagnostics log to the home folder"
