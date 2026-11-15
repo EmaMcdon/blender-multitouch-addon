@@ -32,3 +32,13 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 - **Multi-value slide in Transform → Location only works bottom-up.** Holding X and sliding down to Z doesn't select all three fields, but sliding from Z up to X does. This is a Blender limitation: the official Android build behaves the same way. Rotation and Scale work in both directions.
 - **A resting arm can trigger the bigger UI.** If your arm touches any panel or header after the pen leaves the screen, the UI scales up as if a finger touched it. Raise *After Pen Leaves* in the Touch tab to ignore touches on the pen side for longer after the pen leaves.
 - **Windows only.** It uses Win32 touch and raw-input APIs, so it does nothing on macOS or Linux.
+
+## Tried and dropped
+
+Fixes that were tried, failed in real use and were taken out, so nobody has to try them again:
+
+- **Making the Location slide work top-down (X → Z).** Several helpers were tried: clearing the axis lock, probing the fields above and below the held one (this lit the fields up one after another), clamping the slide to the row centres, and ignoring finger drift for a short window. None of them worked reliably with a real finger, and the probe's flashing fields got in the way. Blender drops the multi-selection when the slide ends off the fields, and its Android build has the same limit.
+- **A setting to make the side panels orbit instead of scroll.** It fought with how Blender treats the sidebars and caused odd behaviour, so the sidebars now behave as they do natively.
+- **Shrinking the bigger UI back after 20 seconds without input.** It worked, but felt wrong in use, so the UI only shrinks when you touch the viewport or use the mouse or pen.
+- **Scrolling a menu by sliding onto its ▼ arrow while holding.** Blender doesn't auto-scroll a menu while the button is held, and the search lists (F3, Add Modifier → Search) never auto-scroll, so a quick one-finger drag scrolls menus instead.
+- **Two-finger scrolling in menus.** It worked, but one-finger dragging was enough, so it was removed to keep the gestures simple.
