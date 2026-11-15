@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 27, 0),
+    "version": (3, 27, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -3180,6 +3180,13 @@ if bpy is not None:
                 if (quiet >= TUI_EXIT_QUIET_S
                         and (self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"])):
                     markers_shrink()
+                if _TUI["pending"]:
+                    if self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"]:
+                        _TUI["pending"] = False
+                    elif (quiet >= TUI_ENTER_DELAY_S and not other_modal_running(context)
+                          and not any(_popup_rects(w) for w in context.window_manager.windows)):
+                        _TUI["pending"] = False
+                        tui_enter()
             tui_tick(t_tick)
             self._anchor_tick(context, t_tick)
             _flush_log()
@@ -3329,6 +3336,12 @@ if bpy is not None:
                 return
             if _TUI["active"]:
                 return
+            if region.type == 'TOOLS':
+                # The toolbar can't scroll to keep the touched button under the finger:
+                # growing now moves it away, and a hold's flyout opens far from the
+                # finger. Grow once the finger is up and any flyout / menu is closed.
+                _TUI["pending"] = True
+                return
             try:
                 vx, vy = region.view2d.region_to_view(rx, ry)
                 sys0 = context.preferences.system.ui_scale
@@ -3473,6 +3486,11 @@ if bpy is not None:
                              or popup_under(context, a[1], a[2]) is not None)):
                     self._ui_hold = {"down": False, "ctrl": False, "xy": (a[1], a[2]),
                                      "moved": [0.0, 0.0]}
+                    if self._anchor is None:
+                        # The UI isn't growing under the finger: hover the button now, so
+                        # Blender has highlighted it when the hold presses (it ignores a
+                        # press that comes with the cursor jump: no flyout would open).
+                        inject_move(a[1], a[2])
                     self._hold_pick = ('UI', target)
                     eng.hold_allowed = True
                     eng.hold_time = UI_HOLD_TIME_S        # shorter, and wobble-tolerant:
