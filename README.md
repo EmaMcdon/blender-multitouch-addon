@@ -14,7 +14,7 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 - **Object edit by touch** (press and hold an object): drag moves it; with a second finger, slide rotates (*Object Slide*: Trackball, or Rotate like R), twist spins and pinch scales. Keyboard Shift makes it precise, Ctrl snaps (5°, 0.1 scale, grid). Value pills show the move, rotation and scale as you go. It has its own *One Action at a Time*.
 - **Edit Mode by touch**: hold a vertex, edge or face to grab it (whichever the select mode picks), or hold part of an existing selection to move all of it. With Blender's snapping on, the hold runs Blender's own move (G) steered by the finger, so Face Project and other snap targets work as with the mouse.
 - **Loop Cut and Knife by touch**: while Loop Cut (Ctrl+R), Knife, Poly Build, Bisect or Offset Edge Loops runs, sliding a finger hovers (shows the preview) and a tap clicks right there.
-- **Bigger selection dots**: vertex and face dots, edges and object outlines grow while you use touch, and go back to your sizes with the mouse or pen.
+- **Bigger selection dots**: vertex and face dots, edges and object outlines grow smoothly while you use touch, and shrink back after 5 seconds without a finger or when you use the mouse or pen.
 - **Palm rejection**: touches on the pen hand's side are ignored while the pen is near and for a set time after it leaves. Right-handed, left-handed and distance modes are available.
 - **Auto-perspective**: one-finger orbit leaves the automatic orthographic view (orthographic chosen with numpad 5 is kept).
 - **Number fields by touch**: drag sideways on a value to change it like a mouse, with the touch point as zero. Add a second finger for Ctrl (snap).

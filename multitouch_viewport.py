@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 27, 2),
+    "version": (3, 28, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1556,10 +1556,16 @@ def theme_grow(p):
     th = bpy.context.preferences.themes[0].view_3d
     if _THEME_BACKUP[0] is None:
         _THEME_BACKUP[0] = (th.outline_width, th.vertex_size, th.edge_width)
-    ow, vs, ew = _THEME_BACKUP[0]
+    cur = _THEME_BACKUP[0]
+    ap = _tui_prefs()
+    # Relative to the user's own sizes (not the bigger touch ones), and never smaller
+    # than what is showing: the glow adds a little on top instead of doubling again.
+    ow, vs, ew = (tuple(ap.base_markers)[:3] if ap is not None and ap.touch_markers_active
+                  else cur)
     p = max(0.0, min(1.0, p))
-    new = (min(5, ow + int(round(p * 3))), min(32, int(round(vs * (1.0 + 1.5 * p)))),
-           min(32, ew + int(round(p * 2))))
+    glow = (min(5, ow + int(round(p * 3))), min(32, int(round(vs * (1.0 + 1.5 * p)))),
+            min(32, ew + int(round(p * 2))))
+    new = tuple(max(a, b) for a, b in zip(glow, cur))
     if (th.outline_width, th.vertex_size, th.edge_width) != new:
         th.outline_width, th.vertex_size, th.edge_width = new
 
@@ -1796,36 +1802,90 @@ def tui_tick(now):
 
 
 # Bigger selection markers while touch is in use: vertex / face dots, edges and the
-# object outline grow so a finger can see what it picks; mouse or pen shrinks them back.
+# object outline grow (quickly, gradually) so a finger can see what it picks. They
+# shrink back the same way after a while without touch, or when mouse / pen is used.
 # The user's own sizes are kept in the add-on preferences (they survive auto-save).
+MARKERS_ANIM_S = 0.2
+MARKERS_IDLE_S = 5.0
+_MARK = {"p": 0.0, "anim": None}     # p: 0 = the user's sizes, 1 = grown
+
+
+def _markers_sizes(base, p):
+    ow, vs, ew, fd = base
+    big = (min(5, ow + 2), min(32, vs * 2), min(32, ew + 1), min(10, fd * 2))
+    return tuple(int(round(a + (b - a) * p)) for a, b in zip(base, big))
+
+
+def _markers_to(target):
+    an = _MARK["anim"]
+    if (an is not None and an[1] == target) or (an is None and _MARK["p"] == target):
+        return
+    _MARK["anim"] = (_MARK["p"], target, time.perf_counter())
+
+
 def markers_grow():
     ap = _tui_prefs()
-    if ap is None or not ap.touch_markers or ap.touch_markers_active or _THEME_BACKUP[0]:
+    if ap is None or not ap.touch_markers:
         return
-    try:
-        th = bpy.context.preferences.themes[0].view_3d
-        ap.base_markers = (th.outline_width, th.vertex_size, th.edge_width, th.facedot_size)
-        ap.touch_markers_active = True
-        th.outline_width = min(5, th.outline_width + 2)
-        th.vertex_size = min(32, th.vertex_size * 2)
-        th.edge_width = min(32, th.edge_width + 1)
-        th.facedot_size = min(10, th.facedot_size * 2)
-        _redraw_3d_views()
-    except Exception:
-        pass
+    if not ap.touch_markers_active:
+        if _THEME_BACKUP[0]:
+            return
+        try:
+            th = bpy.context.preferences.themes[0].view_3d
+            ap.base_markers = (th.outline_width, th.vertex_size, th.edge_width,
+                               th.facedot_size)
+            ap.touch_markers_active = True
+        except Exception:
+            return
+        _MARK["p"] = 0.0
+        _MARK["anim"] = None
+    _markers_to(1.0)
 
 
 def markers_shrink(force=False):
     ap = _tui_prefs()
-    if ap is None or not ap.touch_markers_active or (_THEME_BACKUP[0] and not force):
-        return     # a hold glow is showing: shrink after it
+    if ap is None or not ap.touch_markers_active:
+        return
+    if not force:
+        _markers_to(0.0)
+        return
     try:
         th = bpy.context.preferences.themes[0].view_3d
         th.outline_width, th.vertex_size, th.edge_width, th.facedot_size = ap.base_markers
-        ap.touch_markers_active = False
-        _redraw_3d_views()
     except Exception:
         pass
+    ap.touch_markers_active = False
+    _MARK["p"] = 0.0
+    _MARK["anim"] = None
+    _redraw_3d_views()
+
+
+def markers_tick(now):
+    an = _MARK["anim"]
+    if an is None or _THEME_BACKUP[0] is not None:
+        return       # nothing to do, or a hold glow is showing: carry on after it
+    ap = _tui_prefs()
+    if ap is None or not ap.touch_markers_active:
+        _MARK["anim"] = None
+        return
+    p0, p1, t0 = an
+    f = max(0.0, min(1.0, (now - t0) / MARKERS_ANIM_S))
+    f = f * f * (3.0 - 2.0 * f)                      # ease in and out
+    p = p0 + (p1 - p0) * f
+    _MARK["p"] = p
+    try:
+        th = bpy.context.preferences.themes[0].view_3d
+        new = _markers_sizes(tuple(ap.base_markers), p)
+        if (th.outline_width, th.vertex_size, th.edge_width, th.facedot_size) != new:
+            th.outline_width, th.vertex_size, th.edge_width, th.facedot_size = new
+            _redraw_3d_views()
+    except Exception:
+        pass
+    if f >= 1.0:
+        _MARK["p"] = p1
+        _MARK["anim"] = None
+        if p1 == 0.0:
+            ap.touch_markers_active = False
 
 
 def tui_restore_saved():
@@ -3177,7 +3237,8 @@ if bpy is not None:
                 if (_TUI["active"] and quiet >= TUI_EXIT_QUIET_S
                         and (self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"])):
                     tui_exit()
-                if (quiet >= TUI_EXIT_QUIET_S
+                if quiet >= MARKERS_IDLE_S or (
+                        quiet >= TUI_EXIT_QUIET_S
                         and (self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"])):
                     markers_shrink()
                 if _TUI["pending"]:
@@ -3188,6 +3249,7 @@ if bpy is not None:
                         _TUI["pending"] = False
                         tui_enter()
             tui_tick(t_tick)
+            markers_tick(t_tick)
             self._anchor_tick(context, t_tick)
             _flush_log()
             spent = (time.perf_counter() - t_tick) * 1000.0
