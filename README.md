@@ -12,6 +12,9 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 - **Cancel a view move**: while two fingers move the view, put a third finger down near them (*Cancel Finger*, default 4 cm) and the view snaps back. Touches farther away, like your arm, are ignored.
 - **One Action at a Time** (optional): a two-finger gesture only pans, zooms or rolls, whichever you start with.
 - **Object edit by touch** (press and hold an object): drag moves it; with a second finger, slide rotates (*Object Slide*: Trackball, or Rotate like R), twist spins and pinch scales. Keyboard Shift makes it precise, Ctrl snaps (5°, 0.1 scale, grid). Value pills show the move, rotation and scale as you go. It has its own *One Action at a Time*.
+- **Edit Mode by touch**: hold a vertex, edge or face to grab it (whichever the select mode picks), or hold part of an existing selection to move all of it. With Blender's snapping on, the hold runs Blender's own move (G) steered by the finger, so Face Project and other snap targets work as with the mouse.
+- **Loop Cut and Knife by touch**: while Loop Cut (Ctrl+R), Knife, Poly Build, Bisect or Offset Edge Loops runs, sliding a finger hovers (shows the preview) and a tap clicks right there.
+- **Bigger selection dots**: vertex and face dots, edges and object outlines grow while you use touch, and go back to your sizes with the mouse or pen.
 - **Palm rejection**: touches on the pen hand's side are ignored while the pen is near and for a set time after it leaves. Right-handed, left-handed and distance modes are available.
 - **Auto-perspective**: one-finger orbit leaves the automatic orthographic view (orthographic chosen with numpad 5 is kept).
 - **Number fields by touch**: drag sideways on a value to change it like a mouse, with the touch point as zero. Add a second finger for Ctrl (snap).
@@ -45,6 +48,7 @@ This packs `multitouch_viewport.py` with `blender_manifest.toml` and the license
 
 - **Multi-value slide in Transform → Location only works bottom-up.** Holding X and sliding down to Z doesn't select all three fields, but sliding from Z up to X does. This is a Blender limitation: the official Android build behaves the same way. Rotation and Scale work in both directions.
 - **A resting arm can trigger the bigger UI.** If your arm touches any panel or header after the pen leaves the screen, the UI scales up as if a finger touched it. Raise *After Pen Leaves* in the Touch tab to ignore touches on the pen side for longer after the pen leaves.
+- **With snapping on, a hold only moves.** The hold then runs Blender's own G, which can't rotate or scale with a second finger. Turn the snap magnet off to rotate and scale by touch.
 - **Windows only.** It uses Win32 touch and raw-input APIs, so it does nothing on macOS or Linux.
 
 ## Tried and dropped

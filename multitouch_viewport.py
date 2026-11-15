@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 24, 0),
+    "version": (3, 27, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -924,6 +924,29 @@ def other_modal_running(context):
     return False
 
 
+# Tools that pick what is under the cursor (Loop Cut's preview, Knife): touch points
+# at things directly instead of nudging the cursor like a trackpad.
+_PICK_TOOLS = ("MESH_OT_loopcut", "MESH_OT_knife", "MESH_OT_polybuild", "MESH_OT_bisect",
+               "MESH_OT_offset_edge_loops")
+
+
+def running_tool_ids(context):
+    ids = []
+    try:
+        for w in context.window_manager.windows:
+            for op in w.modal_operators:
+                i = getattr(op, "bl_idname", "") if op is not None else ""
+                if i and i not in _OWN_MODAL:
+                    ids.append(i)
+    except Exception:
+        pass
+    return ids
+
+
+def running_pick_tool(context):
+    return any(i.startswith(_PICK_TOOLS) for i in running_tool_ids(context))
+
+
 def window_under(context, sx, sy):
     """Any Blender window containing the point. The top bar (workspace tabs, menus) and
     the status bar are *global* areas that aren't listed in screen.areas, so
@@ -974,23 +997,61 @@ def hold_pick(context, target):
         return {"kind": "OBJECT", "obj": best[1]} if best else None
     if context.mode == 'EDIT_MESH':
         import bmesh
-        best = None
+        from mathutils.bvhtree import BVHTree
+        vmode, emode, fmode = context.tool_settings.mesh_select_mode
+        origin = v3u.region_2d_to_origin_3d(region, rv3d, co)
+        direction = v3u.region_2d_to_vector_3d(region, rv3d, co)
+        best_v = best_e = best_f = None
         for ob in context.objects_in_mode:
             if ob.type != 'MESH':
                 continue
             bm = bmesh.from_edit_mesh(ob.data)
+            mw = ob.matrix_world
+            # Face under the finger (nearest along the ray).
+            try:
+                mwi = mw.inverted()
+                o = mwi @ origin
+                d3 = (mwi.to_3x3() @ direction).normalized()
+                bm.faces.ensure_lookup_table()
+                loc, _n, idx, _d = BVHTree.FromBMesh(bm).ray_cast(o, d3)
+                if loc is not None and idx is not None and not bm.faces[idx].hide:
+                    wd = (mw @ loc - origin).length
+                    if best_f is None or wd < best_f[0]:
+                        best_f = (wd, ob.name, idx)
+            except Exception:
+                pass
             if len(bm.verts) > _HOLD_MAX_VERTS:
                 continue
-            mw = ob.matrix_world
+            scr = {}
             for v in bm.verts:
                 if v.hide:
                     continue
                 p = v3u.location_3d_to_region_2d(region, rv3d, mw @ v.co)
                 if p is not None:
+                    scr[v.index] = p
                     d = (p - co).length
-                    if d <= radius and (best is None or d < best[0]):
-                        best = (d, ob.name, v.index)
-        return {"kind": "VERT", "obj": best[1], "index": best[2]} if best else None
+                    if d <= radius and (best_v is None or d < best_v[0]):
+                        best_v = (d, ob.name, v.index)
+            if emode and not vmode:
+                for e in bm.edges:
+                    a, b = scr.get(e.verts[0].index), scr.get(e.verts[1].index)
+                    if e.hide or a is None or b is None:
+                        continue
+                    ab = b - a
+                    t = 0.0 if ab.length_squared < 1e-9 else max(0.0, min(1.0, (co - a).dot(ab) / ab.length_squared))
+                    d = (a + ab * t - co).length
+                    if d <= radius and (best_e is None or d < best_e[0]):
+                        best_e = (d, ob.name, e.index)
+        # What the select mode picks first, then whatever else is under the finger.
+        if fmode and not vmode:
+            order = (("FACE", best_f), ("VERT", best_v))
+        elif emode and not vmode:
+            order = (("EDGE", best_e), ("FACE", best_f))
+        else:
+            order = (("VERT", best_v), ("FACE", best_f))
+        for kind, b in order:
+            if b is not None:
+                return {"kind": kind, "obj": b[1], "index": b[2]}
     return None
 
 
@@ -1008,10 +1069,13 @@ def hold_select(context, pick):
         return
     import bmesh
     bm = bmesh.from_edit_mesh(ob.data)
-    bm.verts.ensure_lookup_table()
-    v = bm.verts[pick["index"]]
-    # Edit Mode: always grab just the held vertex (entering Edit Mode often has
-    # everything selected, which would move the whole mesh).
+    seq = {"VERT": bm.verts, "EDGE": bm.edges, "FACE": bm.faces}[pick["kind"]]
+    seq.ensure_lookup_table()
+    el = seq[pick["index"]]
+    # Held on part of a selection you made: move that whole selection. But not when
+    # everything is selected (entering Edit Mode often is), that would move the mesh.
+    if el.select and not all(v.select for v in bm.verts):
+        return
     for o in context.objects_in_mode:
         if o.type != 'MESH':
             continue
@@ -1022,13 +1086,18 @@ def hold_select(context, pick):
         if o is not ob:
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
     vmode, emode, fmode = context.tool_settings.mesh_select_mode
-    if fmode and not vmode:
-        for f in v.link_faces:
+    if pick["kind"] == "VERT" and fmode and not vmode:
+        for f in el.link_faces:
             f.select = True
-    elif emode and not vmode:
-        for e in v.link_edges:
+    elif pick["kind"] == "VERT" and emode and not vmode:
+        for e in el.link_edges:
             e.select = True
-    v.select = True
+    el.select = True       # a face / edge selects its vertices too (flush below)
+    if pick["kind"] != "VERT":
+        for v in el.verts:
+            v.select = True
+    bm.select_history.clear()
+    bm.select_history.add(el)
     bm.select_flush_mode()
     bmesh.update_edit_mesh(ob.data, loop_triangles=False, destructive=False)
 
@@ -1118,6 +1187,73 @@ class HoldEdit:
                     pts.extend(c for _i, c in verts)
         self.valid = bool(pts)
         self.pivot = sum(pts, Vector()) / len(pts) if pts else Vector()
+        # Blender's snap toggle (magnet) with Face Project: moved points land on the
+        # surface under them, like G does. Built once: the meshes that don't move.
+        self.face_trees = []
+        ts = context.scene.tool_settings
+        try:
+            elems = set(ts.snap_elements_individual) | set(ts.snap_elements)
+            if self.valid and ts.use_snap and ts.use_snap_translate and 'FACE_PROJECT' in elems:
+                self.face_trees = self._snap_trees(context, ts)
+        except Exception:
+            self.face_trees = []
+
+    def _snap_trees(self, context, ts):
+        import bmesh
+        from mathutils.bvhtree import BVHTree
+        trees = []
+        moving = {o for o, _inv, _v in self.meshes} | {e[0] for e in self.objects}
+        dg = context.evaluated_depsgraph_get()
+        for ob in context.visible_objects:
+            if ob.type != 'MESH':
+                continue
+            mw = ob.matrix_world
+            if ob in moving:
+                # Snap to Self: the faces of this mesh that don't move with the selection.
+                if context.mode != 'EDIT_MESH' or not ts.use_snap_self:
+                    continue
+                bm = bmesh.from_edit_mesh(ob.data)
+                order = {v: k for k, v in enumerate(bm.verts)}
+                cos = [mw @ v.co for v in bm.verts]
+                polys = [[order[v] for v in f.verts] for f in bm.faces
+                         if not f.hide and not any(v.select for v in f.verts)]
+            else:
+                if context.mode == 'EDIT_MESH' and ob.mode == 'EDIT' and not ts.use_snap_edit:
+                    continue
+                if not ts.use_snap_nonedit and ob.mode != 'EDIT':
+                    continue
+                if ts.use_snap_selectable and ob.hide_select:
+                    continue
+                ev = ob.evaluated_get(dg)
+                try:
+                    me = ev.to_mesh()
+                except Exception:
+                    continue
+                cos = [mw @ v.co for v in me.vertices]
+                polys = [list(p.vertices) for p in me.polygons]
+                ev.to_mesh_clear()
+            if polys:
+                trees.append(BVHTree.FromPolygons(cos, polys))
+        return trees
+
+    def _project(self, p):
+        """Face Project: the surface point under p as seen from the view, or p."""
+        from bpy_extras import view3d_utils as v3u
+        s = v3u.location_3d_to_region_2d(self.region, self.rv3d, p)
+        if s is None:
+            return p
+        o = v3u.region_2d_to_origin_3d(self.region, self.rv3d, s)
+        d = v3u.region_2d_to_vector_3d(self.region, self.rv3d, s).normalized()
+        best = None
+        for tr in self.face_trees:
+            loc, _n, _i, dist = tr.ray_cast(o, d)
+            if loc is not None and (best is None or dist < best[0]):
+                best = (dist, loc)
+        return best[1] if best else p
+
+    def _face_snapping(self):
+        # Ctrl means "snap to increments" for touch: that wins over Face Project.
+        return bool(self.face_trees) and not self.ctrl and self.T.length > 0.0
 
     SNAP_ANGLE = math.radians(5.0)     # Blender's default rotation increment
     SNAP_SCALE = 0.1
@@ -1138,6 +1274,8 @@ class HoldEdit:
             for _i, a in self.free:
                 T += a * (round(self.T.dot(a) / step) * step)
         R = Quaternion(self.into, spin) @ self.R
+        if self.objects and self._face_snapping():
+            T = self._project(self.pivot + T) - self.pivot   # objects: their centre lands
         self._eff = (T, R, S)
         return (Matrix.Translation(self.pivot + T) @ R.to_matrix().to_4x4()
                 @ Matrix.Scale(S, 4) @ Matrix.Translation(-self.pivot))
@@ -1158,11 +1296,12 @@ class HoldEdit:
                     o.scale[i] = scl[i]
                 if o.lock_rotation[i] and o.rotation_mode not in ('QUATERNION', 'AXIS_ANGLE'):
                     o.rotation_euler[i] = rot[i]
+        proj = self._project if (self.meshes and self._face_snapping()) else (lambda p: p)
         for o, inv, verts in self.meshes:
             bm = bmesh.from_edit_mesh(o.data)
             bm.verts.ensure_lookup_table()
             for i, wco in verts:
-                bm.verts[i].co = inv @ (M @ wco)
+                bm.verts[i].co = inv @ proj(M @ wco)
             bmesh.update_edit_mesh(o.data, loop_triangles=False, destructive=False)
         self.area.tag_redraw()
 
@@ -1345,6 +1484,8 @@ def pills_show(he):
         items.append("Scale  %.3f" % S)
     if he.ctrl:
         items.append("Snap")
+    elif he.face_trees:
+        items.append("Snap: Face Project")
     if he.shift:
         items.append("Precise")
     _PILLS["items"] = items
@@ -1654,6 +1795,39 @@ def tui_tick(now):
                 ap.touch_ui_active = False
 
 
+# Bigger selection markers while touch is in use: vertex / face dots, edges and the
+# object outline grow so a finger can see what it picks; mouse or pen shrinks them back.
+# The user's own sizes are kept in the add-on preferences (they survive auto-save).
+def markers_grow():
+    ap = _tui_prefs()
+    if ap is None or not ap.touch_markers or ap.touch_markers_active or _THEME_BACKUP[0]:
+        return
+    try:
+        th = bpy.context.preferences.themes[0].view_3d
+        ap.base_markers = (th.outline_width, th.vertex_size, th.edge_width, th.facedot_size)
+        ap.touch_markers_active = True
+        th.outline_width = min(5, th.outline_width + 2)
+        th.vertex_size = min(32, th.vertex_size * 2)
+        th.edge_width = min(32, th.edge_width + 1)
+        th.facedot_size = min(10, th.facedot_size * 2)
+        _redraw_3d_views()
+    except Exception:
+        pass
+
+
+def markers_shrink(force=False):
+    ap = _tui_prefs()
+    if ap is None or not ap.touch_markers_active or (_THEME_BACKUP[0] and not force):
+        return     # a hold glow is showing: shrink after it
+    try:
+        th = bpy.context.preferences.themes[0].view_3d
+        th.outline_width, th.vertex_size, th.edge_width, th.facedot_size = ap.base_markers
+        ap.touch_markers_active = False
+        _redraw_3d_views()
+    except Exception:
+        pass
+
+
 def tui_restore_saved():
     """Blender started (or the add-on was re-enabled) while touch mode was on."""
     ap = _tui_prefs()
@@ -1668,6 +1842,7 @@ def tui_restore_saved():
             pass
     _TUI["active"] = False
     _TUI["anim"] = None
+    markers_shrink(force=True)
 
 
 UI_HOLD_TIME_S = 0.35
@@ -2017,7 +2192,7 @@ def numdrag_end_later():
         bpy.app.timers.register(_restore_continuous, first_interval=0.3)
 
 
-_VK = {'CTRL': 0x11, 'SHIFT': 0x10}
+_VK = {'CTRL': 0x11, 'SHIFT': 0x10, 'RET': 0x0D, 'ESC': 0x1B}
 
 
 def inject_key(key, down):
@@ -2819,6 +2994,7 @@ if bpy is not None:
             self._rest_cursor = get_cursor()   # where Blender thinks the cursor is
             self._restore_cursor = None
             self._popup_click = None     # [x, y, ticks left]: tap on a menu, cursor moved first
+            self._bl_move = None         # hold with snapping on: Blender's own G, steered
             self._gesture_view = None    # (rv3d, view state) when this touch began moving it
             self._touching = False
             self._raw_block = False      # 3+ fingers on the glass: ignore pointer gestures
@@ -2880,11 +3056,26 @@ if bpy is not None:
                 self._raw_fallback_reported = True
                 _log_info("raw touch data stopped arriving: switched to Windows touch input")
                 self.report({'WARNING'}, "Multitouch: raw touch input not usable, using Windows input")
+            bmv = self._bl_move
+            if bmv is not None and bmv["wait"] is not None:
+                bmv["wait"] -= 1
+                if bmv["wait"] <= 0:
+                    bmv["wait"] = None
+                    try:
+                        with context.temp_override(window=bmv["win"], area=bmv["area"],
+                                                   region=bmv["region"]):
+                            bpy.ops.transform.translate('INVOKE_DEFAULT')
+                        bmv["on"] = True
+                        _log_info("hold: Blender move started (snapping on)")
+                    except Exception as ex:
+                        _log_info("hold: Blender move failed: %s" % ex)
+                        self._bl_move = None
             pc = self._popup_click
             if pc is not None:
                 pc[2] -= 1
                 if pc[2] <= 0:
                     self._popup_click = None
+                    _log_info("tap click at (%d,%d), cursor (%s)" % (pc[0], pc[1], get_cursor()))
                     inject_button('LEFT', True, pc[0], pc[1])
                     inject_button('LEFT', False, pc[0], pc[1])
             events = self._hook.drain()
@@ -2986,6 +3177,9 @@ if bpy is not None:
                 if (_TUI["active"] and quiet >= TUI_EXIT_QUIET_S
                         and (self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"])):
                     tui_exit()
+                if (quiet >= TUI_EXIT_QUIET_S
+                        and (self._hook.mouse["dist"] > TUI_EXIT_MOUSE_PX or pen["in"])):
+                    markers_shrink()
             tui_tick(t_tick)
             self._anchor_tick(context, t_tick)
             _flush_log()
@@ -3117,6 +3311,7 @@ if bpy is not None:
             """First finger down. On the interface: grow it now. On the viewport (or
             another editor's canvas): back to the normal size."""
             self._anchor = None
+            markers_grow()
             ap = _tui_prefs()
             if ap is None or not ap.touch_ui:
                 return
@@ -3314,10 +3509,31 @@ if bpy is not None:
             elif kind == 'hold':
                 theme_grow(1.0)
                 _redraw_3d_views()
+                if context.scene.tool_settings.use_snap:
+                    # Snapping on: run Blender's own move (G) and steer it with the
+                    # finger, so it snaps exactly like the mouse does.
+                    inject_move(*self._amap(a[1], a[2]))
+                    self._bl_move = {"win": window, "area": area, "region": region,
+                                     "wait": 1, "on": False}
+                    return
                 he = HoldEdit(context, window, area, region)
                 he.slide_mode = context.scene.multitouch_props.object_slide
                 self._hold_edit = he if he.valid else None
                 self._hold_header("Touch edit: drag to move | 2nd finger: slide to rotate, twist to spin, pinch to scale | Shift: precise, Ctrl: snap")
+            elif self._bl_move is not None:
+                if kind == 'hold_drag':
+                    tx, ty = self._amap(a[3], a[4])
+                    _log("BLMOVE finger (%d,%d) -> cursor (%d,%d), was %s"
+                         % (a[3], a[4], tx, ty, get_cursor()))
+                    inject_move(tx, ty)
+                if kind in ('hold_end', 'hold_cancel'):
+                    if self._bl_move["on"]:
+                        k = 'RET' if kind == 'hold_end' else 'ESC'
+                        inject_key(k, True)
+                        inject_key(k, False)
+                    self._bl_move = None
+                    self._hold_reset()
+                return
             elif self._hold_edit is not None:
                 he = self._hold_edit
                 if kind == 'hold_drag':
@@ -3466,6 +3682,18 @@ if bpy is not None:
                 # Never move the view, scroll, or run undo/redo underneath it.
                 ctl = self._ctl
                 rest = self._rest_cursor
+                if kind in ('tap', 'drag_begin', 'drag') and running_pick_tool(context):
+                    # Loop Cut / Knife: the finger points. Sliding = hover (preview where
+                    # it goes, nothing is clicked), a tap = click right there.
+                    x, y = self._amap(a[-2], a[-1]) if kind == 'drag' else self._amap(a[1], a[2])
+                    if self._ctl is not None:
+                        self._end_controller()
+                    inject_move(x, y)
+                    self._restore_cursor = (x, y)
+                    if kind == 'tap':
+                        self._popup_click = [x, y, 1]
+                        _log("BUSY %s: tap -> click at finger" % running_tool_ids(context))
+                    return
                 if kind in ('two_begin', 'two', 'two_to_one', 'multi_tap', 'tap', 'drag_begin') \
                         and ctl is not None and ctl.kind in ('VIEW3D', 'SCROLL'):
                     self._end_controller()
@@ -3541,8 +3769,11 @@ if bpy is not None:
                     inject_button('LEFT', False, x, y)
                     return
                 if area.type == 'VIEW_3D' and region.type == 'WINDOW':
-                    inject_button('LEFT', True, x, y)    # viewport: select right away
-                    inject_button('LEFT', False, x, y)
+                    # Viewport select: the cursor first, the click a tick later. A click
+                    # that comes with the jump is picked at the old cursor spot, which
+                    # selects a vertex far from the finger.
+                    inject_move(x, y)
+                    self._popup_click = [x, y, 1]
                     return
                 # Buttons (toolbar, panels, headers): same as menus, the cursor first.
                 # After the UI grew the cursor jumps far, and a click that comes with the
@@ -4009,6 +4240,7 @@ if bpy is not None:
                 sub = box.row()
                 sub.active = ap.touch_ui
                 sub.prop(ap, "touch_ui_scale", slider=True)
+                box.prop(ap, "touch_markers", text="Bigger Selection Dots")
             layout.prop(props, "diag_log")
 
     classes = (
@@ -4038,6 +4270,7 @@ def _force_stop():
     except Exception:
         pass
     theme_restore()
+    markers_shrink(force=True)
     axis_line_hide()
     pills_hide()
     try:
@@ -4086,7 +4319,17 @@ if bpy is not None:
             description="How much bigger the interface gets in touch mode",
             default=1.3, min=1.05, max=2.0, step=5, precision=2,
         )
+        touch_markers: bpy.props.BoolProperty(
+            name="Bigger Selection Dots for Fingers",
+            description="When you use touch, vertex and face dots, edges and object outlines "
+                        "get bigger; the mouse or pen shrinks them back",
+            default=True,
+            update=lambda self, ctx: (None if self.touch_markers else markers_shrink(force=True)),
+        )
         # Internal: the user's own values while touch mode is on (survive auto-save).
+        touch_markers_active: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
+        base_markers: bpy.props.IntVectorProperty(size=4, default=(1, 3, 1, 4),
+                                                  options={'HIDDEN'})
         touch_ui_active: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
         base_ui_scale: bpy.props.FloatProperty(default=1.0, options={'HIDDEN'})
         base_tooltips: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
@@ -4098,6 +4341,7 @@ if bpy is not None:
             sub = row.row()
             sub.active = self.touch_ui
             sub.prop(self, "touch_ui_scale", slider=True)
+            self.layout.prop(self, "touch_markers")
 
 
 def _auto_start_enabled():
