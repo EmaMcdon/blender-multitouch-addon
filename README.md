@@ -11,7 +11,7 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 - **5-finger hold**: opens a touch pie (Mode, Undo, Redo, Previous View, Focus Mode, Bigger UI, Palm Rejection, Frame Selected).
 - **Cancel a view move**: while two fingers move the view, put a third finger down near them (*Cancel Finger*, default 4 cm) and the view snaps back. Touches farther away, like your arm, are ignored.
 - **One Action at a Time** (optional): a two-finger gesture only pans, zooms or rolls, whichever you start with.
-- **Object Slide**: sliding two fingers on a held object rolls it like a trackball, or turns it like a turntable (*Rotate*).
+- **Object edit by touch** (press and hold an object): drag moves it; with a second finger, slide rotates (*Object Slide*: Trackball, or Rotate like R), twist spins and pinch scales. Keyboard Shift makes it precise, Ctrl snaps (5°, 0.1 scale, grid). Value pills show the move, rotation and scale as you go. It has its own *One Action at a Time*.
 - **Palm rejection**: touches on the pen hand's side are ignored while the pen is near and for a set time after it leaves. Right-handed, left-handed and distance modes are available.
 - **Auto-perspective**: one-finger orbit leaves the automatic orthographic view (orthographic chosen with numpad 5 is kept).
 - **Number fields by touch**: drag sideways on a value to change it like a mouse, with the touch point as zero. Add a second finger for Ctrl (snap).

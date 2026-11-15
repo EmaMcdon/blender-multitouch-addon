@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 21, 0),
+    "version": (3, 24, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1067,7 +1067,7 @@ class HoldEdit:
     """Moves / rotates / scales the selection directly (no modal transform operator),
     so one- and two-finger input can be combined freely like a photo app."""
 
-    slide_mode = 'TRACKBALL'   # two-finger slide: 'TRACKBALL' (like R R) or 'ROTATE' (turntable)
+    slide_mode = 'TRACKBALL'   # two-finger slide: 'TRACKBALL' (like R R) or 'ROTATE' (like R)
 
     def __init__(self, context, window, area, region):
         import bmesh
@@ -1083,8 +1083,11 @@ class HoldEdit:
             basis = self._location_basis(act)
             self.free = [(i, basis[i]) for i in range(3) if not act.lock_location[i]]
         self.T = Vector((0.0, 0.0, 0.0))
-        self.R = Quaternion()
+        self.R = Quaternion()      # trackball part of the rotation
+        self.spin = 0.0            # turn about the axis into the screen (R-like + twist), rad
+        self.into = self.rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
         self.S = 1.0
+        self.shift = self.ctrl = False   # keyboard Shift = precision, Ctrl = snap
         self.changed = False
         self.objects = []   # (object, base matrix_world)
         self.meshes = []    # (object, matrix_world_inv, [(vert index, base world co)])
@@ -1116,10 +1119,32 @@ class HoldEdit:
         self.valid = bool(pts)
         self.pivot = sum(pts, Vector()) / len(pts) if pts else Vector()
 
+    SNAP_ANGLE = math.radians(5.0)     # Blender's default rotation increment
+    SNAP_SCALE = 0.1
+    PRECISION = 0.1                    # Shift: one tenth of the finger motion
+
+    def _snap_step(self):
+        """Move increment like Blender's view grid: 1 m at a normal zoom, 0.1 m closer in."""
+        return 10.0 ** math.floor(math.log10(max(self.rv3d.view_distance, 1e-6) / 5.0))
+
     def _matrix(self):
         from mathutils import Matrix
-        return (Matrix.Translation(self.pivot + self.T) @ self.R.to_matrix().to_4x4()
-                @ Matrix.Scale(self.S, 4) @ Matrix.Translation(-self.pivot))
+        T, spin, S = self.T, self.spin, self.S
+        if self.ctrl:
+            spin = round(spin / self.SNAP_ANGLE) * self.SNAP_ANGLE
+            S = max(self.SNAP_SCALE, round(S / self.SNAP_SCALE) * self.SNAP_SCALE)
+            step = self._snap_step()
+            T = Vector((0.0, 0.0, 0.0))
+            for _i, a in self.free:
+                T += a * (round(self.T.dot(a) / step) * step)
+        R = Quaternion(self.into, spin) @ self.R
+        self._eff = (T, R, S)
+        return (Matrix.Translation(self.pivot + T) @ R.to_matrix().to_4x4()
+                @ Matrix.Scale(S, 4) @ Matrix.Translation(-self.pivot))
+
+    def _keys(self):
+        self.shift, self.ctrl = _key_held(0x10), _key_held(0x11)   # VK_SHIFT, VK_CONTROL
+        return self.PRECISION if self.shift else 1.0
 
     def _write(self, M):
         import bmesh
@@ -1144,6 +1169,7 @@ class HoldEdit:
     def apply(self):
         self.changed = True
         self._write(self._matrix())
+        pills_show(self)
         if len(self.free) == 1 and self.T.length > 0.0:
             i, a = self.free[0]
             axis_line_show(self.pivot + self.T, a, i)
@@ -1205,33 +1231,40 @@ class HoldEdit:
         return None
 
     def move(self, sx0, sy0, sx1, sy1):
-        self.drag += Vector((sx1 - sx0, -(sy1 - sy0)))
+        f = self._keys()
+        self.drag += Vector((sx1 - sx0, -(sy1 - sy0))) * f
         self._update_translation()
         self.apply()
 
     TRACKBALL_PX_PER_HALF_TURN = 500.0   # x UI scale: two-finger slide this far = 180 deg
 
     def two(self, dx, dy, zoom, dangle, cx, cy):
-        if dx or dy:
+        f = self._keys()
+        if (dx or dy) and self.slide_mode == 'ROTATE':
+            # Like R: the fingers turn the object about the axis pointing at you, by the
+            # angle they sweep around its centre on screen.
+            from bpy_extras import view3d_utils as v3u
+            p2 = v3u.location_3d_to_region_2d(self.region, self.rv3d, self.pivot + self.T)
+            if p2 is not None:
+                cur = _region_co(self.window, self.region, cx, cy) - p2
+                prev = _region_co(self.window, self.region, cx - dx, cy - dy) - p2
+                if min(cur.length, prev.length) > 20.0 * _ui_scale():   # too close: unsteady
+                    a = _wrap_angle(math.atan2(cur.y, cur.x) - math.atan2(prev.y, prev.x))
+                    self.spin -= a * f          # + a = counter-clockwise on screen
+        elif dx or dy:
             # Trackball (like R then R): sliding both fingers rolls the object in that
             # direction about the pivot. Screen y is down: dragging right turns the front
             # towards the right (about view-up), dragging down tips it down (about view-right).
-            k = math.pi / (self.TRACKBALL_PX_PER_HALF_TURN * _ui_scale())
+            k = f * math.pi / (self.TRACKBALL_PX_PER_HALF_TURN * _ui_scale())
             vr = self.rv3d.view_rotation
             right = vr @ Vector((1.0, 0.0, 0.0))
-            if self.slide_mode == 'ROTATE':
-                # Turntable: sideways spins about the world up axis (Z), up/down tilts
-                # towards / away from you - the object never rolls sideways.
-                up = Vector((0.0, 0.0, 1.0))
-            else:
-                up = vr @ Vector((0.0, 1.0, 0.0))
+            up = vr @ Vector((0.0, 1.0, 0.0))
             self.R = (Quaternion(up, dx * k) @ Quaternion(right, dy * k) @ self.R).normalized()
-        self.S = max(1e-3, min(self.S * zoom, 1e3))
+        self.S = max(1e-3, min(self.S * max(zoom, 1e-3) ** f, 1e3))
         if dangle:
             # Screen y points down, so a positive twist is clockwise on screen: that's a
             # positive rotation about the axis pointing *into* the screen.
-            into_screen = self.rv3d.view_rotation @ Vector((0.0, 0.0, -1.0))
-            self.R = Quaternion(into_screen, dangle) @ self.R
+            self.spin += dangle * f
         self.apply()
 
     def cancel(self):
@@ -1281,6 +1314,97 @@ def axis_line_hide():
         except Exception:
             pass
         _AXIS_LINE[0] = None
+
+
+# Value pills while an object is edited by touch: one per thing that changed (move,
+# rotate, scale) plus Snap / Precise, like Blender's own transform read-out.
+_PILLS = {"handle": None, "area": None, "items": []}
+
+
+def _fmt_len(v):
+    try:
+        us = bpy.context.scene.unit_settings
+        if us.system != 'NONE':
+            return bpy.utils.units.to_string(us.system, 'LENGTH', v * us.scale_length,
+                                             precision=3)
+    except Exception:
+        pass
+    return "%.3f" % v
+
+
+def pills_show(he):
+    T, R, S = he._eff
+    items = []
+    if T.length > 1e-6:
+        items.append("Move  %s   X %s  Y %s  Z %s" % (_fmt_len(T.length), _fmt_len(T.x),
+                                                       _fmt_len(T.y), _fmt_len(T.z)))
+    ang = math.degrees(R.angle)
+    if ang > 0.05:
+        items.append("Rotate  %.1f\u00b0" % ang)
+    if abs(S - 1.0) > 1e-4:
+        items.append("Scale  %.3f" % S)
+    if he.ctrl:
+        items.append("Snap")
+    if he.shift:
+        items.append("Precise")
+    _PILLS["items"] = items
+    _PILLS["area"] = he.area.as_pointer()
+    if _PILLS["handle"] is None:
+        _PILLS["handle"] = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_pills, (), 'WINDOW', 'POST_PIXEL')
+
+
+def pills_hide():
+    _PILLS["items"] = []
+    if _PILLS["handle"] is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_PILLS["handle"], 'WINDOW')
+        except Exception:
+            pass
+        _PILLS["handle"] = None
+        _redraw_3d_views()
+
+
+def _draw_pills():
+    try:
+        ctx = bpy.context
+        items = _PILLS["items"]
+        if not items or ctx.area is None or ctx.area.as_pointer() != _PILLS["area"]:
+            return
+        import blf
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+        region = ctx.region
+        sc = _ui_scale()
+        font = 0
+        size = 13.0 * sc
+        blf.size(font, size)
+        pad, gap = 10.0 * sc, 6.0 * sc
+        cap = blf.dimensions(font, "X")[1]
+        h = cap + 2.0 * pad
+        widths = [blf.dimensions(font, t)[0] + 2.0 * pad for t in items]
+        x = max(4.0, (region.width - (sum(widths) + gap * (len(items) - 1))) * 0.5)
+        y = 40.0 * sc
+        r = h * 0.5
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        for text, w in zip(items, widths):
+            pts = [(x + w * 0.5, y + r)]
+            for cx, a0 in ((x + w - r, -90.0), (x + r, 90.0)):    # right end, left end
+                for k in range(13):
+                    a = math.radians(a0 + 15.0 * k)
+                    pts.append((cx + r * math.cos(a), y + r + r * math.sin(a)))
+            pts.append(pts[1])
+            batch = batch_for_shader(shader, 'TRI_FAN', {"pos": pts})
+            shader.uniform_float("color", (0.08, 0.08, 0.08, 0.82))
+            batch.draw(shader)
+            blf.position(font, x + pad, y + (h - cap) * 0.5, 0)
+            blf.color(font, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font, text)
+            x += w + gap
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
 
 
 _THEME_BACKUP = [None]   # (outline_width, vertex_size, edge_width) while the hold glow is shown
@@ -1669,6 +1793,16 @@ def popup_under(context, sx, sy):
             if x0 <= lx <= x1 and y0 <= ly <= y1:
                 return window
     return None
+
+
+def _key_held(vk):
+    """Is this keyboard key held right now (physical state, e.g. Shift / Ctrl)?"""
+    if not IS_WINDOWS:
+        return False
+    try:
+        return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return False
 
 
 def _numdrag_region(area, region):
@@ -2950,6 +3084,7 @@ if bpy is not None:
             self._hold_pick = None
             self._hold_sel = False
             self._hold_edit = None
+            pills_hide()
             if _AXIS_LINE[0] is not None:
                 axis_line_hide()
                 _redraw_3d_views()
@@ -3182,7 +3317,7 @@ if bpy is not None:
                 he = HoldEdit(context, window, area, region)
                 he.slide_mode = context.scene.multitouch_props.object_slide
                 self._hold_edit = he if he.valid else None
-                self._hold_header("Touch edit: drag to move | 2nd finger: slide to roll, twist to spin, pinch to scale")
+                self._hold_header("Touch edit: drag to move | 2nd finger: slide to rotate, twist to spin, pinch to scale | Shift: precise, Ctrl: snap")
             elif self._hold_edit is not None:
                 he = self._hold_edit
                 if kind == 'hold_drag':
@@ -3190,7 +3325,8 @@ if bpy is not None:
                     he.move(x - dx, y - dy, x, y)
                 elif kind == 'hold_two_begin':
                     self._hold_lock = (GestureLock(4.0 * self._engine.threshold, a[1:3])
-                                       if context.scene.multitouch_props.one_action else None)
+                                       if context.scene.multitouch_props.object_one_action
+                                       else None)
                 elif kind == 'hold_two':
                     dx, dy, zoom, dang, cx, cy = a[1:]
                     lk = getattr(self, "_hold_lock", None)
@@ -3747,9 +3883,15 @@ if bpy is not None:
         )
         one_action: bpy.props.BoolProperty(
             name="One Action at a Time",
-            description="Two-finger gestures do only one thing until you lift: slide (pan), "
-                        "pinch (zoom) or twist (roll), whichever you start with. Also for "
-                        "objects moved with a hold: roll, scale or spin",
+            description="Two-finger gestures in the 3D View do only one thing until you lift: "
+                        "slide (pan), pinch (zoom) or twist (roll), whichever you start with",
+            default=False,
+        )
+        object_one_action: bpy.props.BoolProperty(
+            name="One Action at a Time",
+            description="Two fingers on an object held with a press-and-hold do only one thing "
+                        "until you lift: slide (rotate), pinch (scale) or twist (spin), whichever "
+                        "you start with",
             default=False,
         )
         object_slide: bpy.props.EnumProperty(
@@ -3758,8 +3900,8 @@ if bpy is not None:
             items=[
                 ('TRACKBALL', "Trackball", "Rolls the object freely in the slide direction "
                                            "(like R R)"),
-                ('ROTATE', "Rotate", "Turntable: sideways spins it about the world Z axis, "
-                                     "up/down tilts it towards or away from you"),
+                ('ROTATE', "Rotate", "Turns it about the axis pointing at you, by the angle "
+                                     "your fingers sweep around it (like R)"),
             ],
             default='TRACKBALL',
         )
@@ -3846,7 +3988,10 @@ if bpy is not None:
             layout.prop(props, "zoom_speed", slider=True)
             layout.prop(props, "twist_roll")
             layout.prop(props, "one_action")
-            layout.prop(props, "object_slide")
+            box = layout.box()
+            box.label(text="Object Edit (press and hold):")
+            box.prop(props, "object_slide")
+            box.prop(props, "object_one_action")
             layout.prop(props, "pen_only_paint")
             box = layout.box()
             box.prop(props, "palm_reject")
@@ -3894,6 +4039,7 @@ def _force_stop():
         pass
     theme_restore()
     axis_line_hide()
+    pills_hide()
     try:
         if getattr(op, "_timer", None) is not None:
             bpy.context.window_manager.event_timer_remove(op._timer)
