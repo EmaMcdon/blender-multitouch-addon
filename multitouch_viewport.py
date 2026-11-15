@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 20, 2),
+    "version": (3, 21, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1067,6 +1067,8 @@ class HoldEdit:
     """Moves / rotates / scales the selection directly (no modal transform operator),
     so one- and two-finger input can be combined freely like a photo app."""
 
+    slide_mode = 'TRACKBALL'   # two-finger slide: 'TRACKBALL' (like R R) or 'ROTATE' (turntable)
+
     def __init__(self, context, window, area, region):
         import bmesh
         self.window, self.area, self.region = window, area, region
@@ -1217,7 +1219,12 @@ class HoldEdit:
             k = math.pi / (self.TRACKBALL_PX_PER_HALF_TURN * _ui_scale())
             vr = self.rv3d.view_rotation
             right = vr @ Vector((1.0, 0.0, 0.0))
-            up = vr @ Vector((0.0, 1.0, 0.0))
+            if self.slide_mode == 'ROTATE':
+                # Turntable: sideways spins about the world up axis (Z), up/down tilts
+                # towards / away from you - the object never rolls sideways.
+                up = Vector((0.0, 0.0, 1.0))
+            else:
+                up = vr @ Vector((0.0, 1.0, 0.0))
             self.R = (Quaternion(up, dx * k) @ Quaternion(right, dy * k) @ self.R).normalized()
         self.S = max(1e-3, min(self.S * zoom, 1e3))
         if dangle:
@@ -3173,6 +3180,7 @@ if bpy is not None:
                 theme_grow(1.0)
                 _redraw_3d_views()
                 he = HoldEdit(context, window, area, region)
+                he.slide_mode = context.scene.multitouch_props.object_slide
                 self._hold_edit = he if he.valid else None
                 self._hold_header("Touch edit: drag to move | 2nd finger: slide to roll, twist to spin, pinch to scale")
             elif self._hold_edit is not None:
@@ -3744,6 +3752,17 @@ if bpy is not None:
                         "objects moved with a hold: roll, scale or spin",
             default=False,
         )
+        object_slide: bpy.props.EnumProperty(
+            name="Object Slide",
+            description="What sliding two fingers does to an object held with a press-and-hold",
+            items=[
+                ('TRACKBALL', "Trackball", "Rolls the object freely in the slide direction "
+                                           "(like R R)"),
+                ('ROTATE', "Rotate", "Turntable: sideways spins it about the world Z axis, "
+                                     "up/down tilts it towards or away from you"),
+            ],
+            default='TRACKBALL',
+        )
         twist_roll: bpy.props.BoolProperty(
             name="Twist to Roll",
             description="Twisting two fingers rolls the 3D View (turns it clockwise / "
@@ -3827,6 +3846,7 @@ if bpy is not None:
             layout.prop(props, "zoom_speed", slider=True)
             layout.prop(props, "twist_roll")
             layout.prop(props, "one_action")
+            layout.prop(props, "object_slide")
             layout.prop(props, "pen_only_paint")
             box = layout.box()
             box.prop(props, "palm_reject")
