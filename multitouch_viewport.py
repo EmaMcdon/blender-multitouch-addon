@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 15, 4),
+    "version": (3, 20, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -35,6 +35,7 @@ IS_WINDOWS = sys.platform.startswith("win")
 WHEEL_DELTA = 120
 SCROLL_PIXELS_PER_NOTCH = 30.0   # vertical drag pixels per wheel notch
 TWIST_START_RAD = math.radians(15.0)   # two-finger twist before the view starts to roll
+FIVE_HOLD_S = 0.6       # 5 fingers held this long (and still) opens the touch pie
 TAP_TIMEOUT_S = 0.5              # multi-finger tap window (same as the demo build)
 DRAG_THRESHOLD_POINTS = 5.0      # scaled by DPI / 96 (15 px at Android's 288 DPI)
 
@@ -105,6 +106,64 @@ _STOP = [False]     # set by the Stop button
 _PENDING_REPORT = [None]
 
 
+_VIEW_HISTORY = []        # [(rv3d, view state)] before each touch move, newest last
+_VIEW_HISTORY_MAX = 20
+
+
+def _view_state(rv3d):
+    return (rv3d.view_location.copy(), rv3d.view_rotation.copy(), rv3d.view_distance,
+            rv3d.view_perspective)
+
+
+def _view_restore(rv3d, st):
+    loc, rot, dist, persp = st
+    rv3d.view_location = loc
+    rv3d.view_rotation = rot
+    rv3d.view_distance = dist
+    rv3d.view_perspective = persp
+    _redraw_3d_views()
+
+
+def _view_same(a, b):
+    return ((a[0] - b[0]).length < 1e-6 and a[1].rotation_difference(b[1]).angle < 1e-6
+            and abs(a[2] - b[2]) < 1e-6 and a[3] == b[3])
+
+
+def _view_back():
+    """Previous View: back to the view before the last touch move."""
+    while _VIEW_HISTORY:
+        rv3d, st = _VIEW_HISTORY.pop()
+        try:
+            _view_restore(rv3d, st)
+            return {'FINISHED'}
+        except Exception:
+            continue          # that 3D View is gone: try the one before
+    return {'CANCELLED'}
+
+
+def _run_five(what):
+    """5-finger hold, from a timer (outside the modal handler): ('PIE', x, y) the touch pie."""
+    try:
+        ctx = bpy.context
+        if other_modal_running(ctx):
+            return None
+        target = find_target(ctx, what[1], what[2])
+        if target is None:
+            win = ctx.window or ctx.window_manager.windows[0]
+            area = next((a for a in win.screen.areas if a.type == 'VIEW_3D'),
+                        win.screen.areas[0])
+        else:
+            win, area = target[0], target[1]
+        region = next((r for r in area.regions if r.type == 'WINDOW'), area.regions[0])
+        with ctx.temp_override(window=win, screen=win.screen, area=area, region=region):
+            bpy.ops.wm.call_menu_pie(name="VIEW3D_MT_multitouch_pie")
+        _log_info("5-finger hold: touch pie")
+    except Exception:
+        import traceback
+        _log_error("5-finger gesture:\n" + traceback.format_exc())
+    return None
+
+
 def _run_tap_action(action, cx, cy):
     """Runs from a bpy.app.timers callback, i.e. outside the modal handler, the same
     way a key-map item would run ed.undo / ed.redo / screen.screen_full_area."""
@@ -127,6 +186,8 @@ def _run_tap_action(action, cx, cy):
                 res, label = bpy.ops.ed.undo(), "Undo"
             elif action == 'REDO':
                 res, label = bpy.ops.ed.redo(), "Redo"
+            elif action == 'VIEW_BACK':
+                res, label = _view_back(), "Previous View"
             elif action in ('FOCUS', 'MAXIMIZE'):
                 res = bpy.ops.screen.screen_full_area(use_hide_panels=(action == 'FOCUS'))
                 label = "Focus Mode" if action == 'FOCUS' else "Maximize Area"
@@ -393,8 +454,10 @@ class TouchEngine:
       ('two', dx, dy, zoom, cx, cy)       centroid delta + pinch ratio (>1 = spread)
       ('twist', dang, cx, cy)             two-finger rotation (radians, + = clockwise)
       ('two_to_one', x, y)                one finger lifted, the other keeps navigating
-      ('multi_tap', n, cx, cy)            2/3/4-finger tap
+      ('multi_tap', n, cx, cy)            2/3/4/5-finger tap
       ('end',)                            current gesture finished or was suppressed
+      ('cancel', x, y)                    3rd finger near a 2-finger gesture: undo it
+      ('five_hold', cx, cy)               5 fingers held still
     Press-and-hold (only when the operator set hold_allowed after 'press'):
       ('hold_progress', p, x, y)          0 < p < 1 while the finger stays still
       ('hold', x, y)                      hold completed: editing starts
@@ -410,6 +473,11 @@ class TouchEngine:
         if threshold_px is None:
             threshold_px = max(DRAG_THRESHOLD_POINTS, DRAG_THRESHOLD_POINTS * _system_dpi() / 96.0)
         self.threshold = float(threshold_px)
+        self.cm_px = 40.0          # touchscreen px per cm (the operator sets the real value)
+        # A 3rd touch this close (px) to a finger of a 2-finger gesture cancels it;
+        # farther away (an arm, the other hand) it is ignored. 0 = any 3rd touch cancels,
+        # below 0 = never cancel (3rd touches are ignored).
+        self.cancel_px = 0.0
         self.tap_timeout = tap_timeout
         self.hold_time = hold_time
         self.hold_preview = hold_preview
@@ -427,6 +495,8 @@ class TouchEngine:
         self.tap_count = 0
         self.hold_allowed = False
         self.hold_slop = 1.0       # drag threshold multiplier while a hold is allowed
+        self.five = None           # (time, centroid) once 5 fingers are down together
+        self.extra = {}            # pid -> [x, y]: touches a 2-finger gesture ignores (arm)
 
     def _two_metrics(self):
         a, b = list(self.touches.values())[:2]
@@ -436,6 +506,13 @@ class TouchEngine:
     def tick(self, t):
         """Call regularly (every modal timer tick) to drive press-and-hold timing."""
         out = []
+        if (self.mode == MULTI_TAP and self.five is not None and len(self.touches) == 5
+                and t - self.five[0] >= FIVE_HOLD_S):
+            cx, cy = self._centroid()
+            if math.hypot(cx - self.five[1][0], cy - self.five[1][1]) < self.cm_px:
+                out.append(('five_hold', cx, cy))
+                self.mode = SUPPRESSED
+            return out
         if self.mode != TAP_PENDING or not self.hold_allowed or len(self.touches) != 1:
             return out
         x, y = next(iter(self.touches.values()))[:2]
@@ -465,10 +542,30 @@ class TouchEngine:
         self.prev_dist = math.hypot(b[0] - a[0], b[1] - a[1])
         self.prev_angle = math.atan2(b[1] - a[1], b[0] - a[0])
 
+    def _begin_five(self, t, x, y, prev_mode, out=None):
+        """Five fingers on the glass, however they landed: a 5-finger tap / slide / hold.
+        A view move the first fingers started is undone (they were landing, not moving)."""
+        out = [] if out is None else out
+        for pid, (ex, ey) in self.extra.items():
+            self.touches[pid] = [ex, ey, ex, ey]
+        self.extra = {}
+        if prev_mode in (DRAG, ORBIT1, TWO_PAN):
+            out.append(('cancel', float(x), float(y)))
+        for tp in self.touches.values():
+            tp[2], tp[3] = tp[0], tp[1]
+        self.mode = MULTI_TAP
+        self.tap_count = 5
+        self.tap_t0 = t
+        self.start = self._centroid()
+        self.five = (t, self.start)
+        return out
+
     def _tap_valid(self, t):
         if t - self.tap_t0 > self.tap_timeout:
             return False
-        thr2 = self.threshold * self.threshold
+        # A whole hand never lands perfectly still: 5 fingers may wobble up to 1 cm.
+        thr = self.cm_px if self.five is not None else self.threshold
+        thr2 = thr * thr
         for x, y, sx, sy in self.touches.values():
             if (x - sx) ** 2 + (y - sy) ** 2 >= thr2:
                 return False
@@ -484,9 +581,20 @@ class TouchEngine:
         out = []
         if pid in self.touches:
             return out
+        if (self.mode == TWO_PAN and len(self.touches) == 2 and self.cancel_px != 0.0
+                and (self.cancel_px < 0.0 or
+                     min(math.hypot(x - tp[0], y - tp[1]) for tp in self.touches.values())
+                     > self.cancel_px)):
+            self.extra[pid] = [float(x), float(y)]
+            if len(self.touches) + len(self.extra) < 5:
+                return out     # not a finger of this hand: the gesture goes on
+            return self._begin_five(t, x, y, prev_mode=self.mode)
         prev_mode = self.mode
         self.touches[pid] = [float(x), float(y), float(x), float(y)]
         n = len(self.touches)
+
+        if prev_mode not in (HOLD, HOLD_TWO) and self.five is None and n + len(self.extra) >= 5:
+            return self._begin_five(t, x, y, prev_mode, out)
 
         if prev_mode in (HOLD, HOLD_TWO):
             if n == 2:
@@ -505,9 +613,11 @@ class TouchEngine:
             out.append(('press', float(x), float(y)))
         elif prev_mode == MULTI_TAP:
             # Replacing an already released finger does not extend the same tap.
-            if n <= 4 and n == self.tap_count + 1:
+            if n <= 5 and n == self.tap_count + 1:
                 self.tap_count = n
                 self.start = self._centroid()
+                if n == 5:
+                    self.five = (t, self.start)
             else:
                 self._suppress(out)
         elif n == 2:
@@ -520,7 +630,10 @@ class TouchEngine:
                 self._begin_two(TWO_PAN)
                 out.append(('two_begin',) + self.start)
         else:
-            if prev_mode in (DRAG, ORBIT1, TWO_PAN):
+            if prev_mode == TWO_PAN:
+                out.append(('cancel', float(x), float(y)))   # extra finger: undo the move
+                self.mode = SUPPRESSED
+            elif prev_mode in (DRAG, ORBIT1):
                 out.append(('end',))
                 self.mode = SUPPRESSED
             else:
@@ -529,6 +642,10 @@ class TouchEngine:
 
     def move(self, pid, x, y, t):
         out = []
+        ex = self.extra.get(pid)
+        if ex is not None:
+            ex[0], ex[1] = float(x), float(y)
+            return out
         tp = self.touches.get(pid)
         if tp is None:
             return out
@@ -560,6 +677,8 @@ class TouchEngine:
                 self.prev = (float(x), float(y))
             return out
 
+        if self.mode == MULTI_TAP and self.five is not None:
+            return out     # 5 fingers: tick() decides the hold, up() the tap
         if self.mode == MULTI_TAP:
             if self._tap_valid(t):
                 return out
@@ -594,6 +713,9 @@ class TouchEngine:
 
     def up(self, pid, x, y, t, canceled=False):
         out = []
+        if pid in self.extra:
+            del self.extra[pid]
+            return out
         tp = self.touches.get(pid)
         if tp is None:
             return out
@@ -637,7 +759,7 @@ class TouchEngine:
             if not canceled and self._tap_valid(t):
                 del self.touches[pid]
                 if not self.touches:
-                    if 2 <= self.tap_count <= 4:
+                    if 2 <= self.tap_count <= 5:
                         out.append(('multi_tap', self.tap_count) + self.start)
                     self.reset()
                 return out
@@ -909,6 +1031,36 @@ def hold_select(context, pick):
     v.select = True
     bm.select_flush_mode()
     bmesh.update_edit_mesh(ob.data, loop_triangles=False, destructive=False)
+
+
+class GestureLock:
+    """'One Action at a Time': watch a two-finger gesture until slide, pinch or twist
+    clearly leads (by finger travel in px), then keep only that one until the fingers
+    lift. Nothing moves while it is still undecided."""
+
+    def __init__(self, decide_px, start):
+        self.decide_px = decide_px
+        self.start = start            # centroid at touch-down: a pinch zooms around it
+        self.pan = [0.0, 0.0]
+        self.spread = 0.0
+        self.twist = 0.0
+        self.kind = None
+
+    def feed(self, dx, dy, zoom, dangle, dist):
+        if self.kind is None:
+            self.pan[0] += dx
+            self.pan[1] += dy
+            if zoom > 0.0:
+                self.spread += math.log(zoom) * dist      # ~ change of finger spread
+            self.twist += dangle * dist * 0.5             # ~ travel of each finger
+            lead = {'PAN': math.hypot(*self.pan), 'ZOOM': abs(self.spread),
+                    'TWIST': abs(self.twist)}
+            k = max(lead, key=lead.get)
+            if lead[k] >= self.decide_px:
+                self.kind = k
+                _log_info("one action: %s" % {'PAN': "slide", 'ZOOM': "pinch",
+                                               'TWIST': "twist"}[k])
+        return self.kind
 
 
 class HoldEdit:
@@ -2428,13 +2580,15 @@ _TAP_ACTIONS = [
     ('REDO', "Redo", "Redo the last undone action"),
     ('FOCUS', "Focus Mode", "Toggle fullscreen area with all panels hidden"),
     ('MAXIMIZE', "Maximize Area", "Toggle maximized area"),
+    ('VIEW_BACK', "Previous View", "Back to the view before the last touch move "
+                                   "(again for further back)"),
 ]
 
 
 class _Controller:
     """The thing a running gesture is driving (one per gesture)."""
     __slots__ = ("kind", "window", "area", "region", "rv3d", "button", "wheel", "wheel_x", "last_xy",
-                 "anchor", "start", "acc", "decided", "keys", "fxy", "twist")
+                 "anchor", "start", "acc", "decided", "keys", "fxy", "twist", "lock")
 
     def __init__(self, kind, area=None, region=None, rv3d=None, window=None):
         self.kind = kind
@@ -2453,6 +2607,7 @@ class _Controller:
         self.keys = []       # modifier keys held for this gesture
         self.fxy = None      # first finger's last position (number drags follow only it)
         self.twist = 0.0     # two-finger rotation so far; rolls the view once past a threshold
+        self.lock = None     # GestureLock when 'One Action at a Time' is on
 
 
 # Main regions that aren't View2D: they still scroll with the mouse wheel (which is
@@ -2496,6 +2651,7 @@ if bpy is not None:
             self._anchor = None      # what the finger touched while the UI grows
             self._pen_reported = False
             self._px_per_cm = touch_px_per_cm()
+            self._engine.cm_px = self._px_per_cm
             _log_info("touchscreen: %.1f px per cm" % self._px_per_cm)
             raw = self._hook.raw
             self._raw_fallback_reported = False
@@ -2514,6 +2670,7 @@ if bpy is not None:
             self._rest_cursor = get_cursor()   # where Blender thinks the cursor is
             self._restore_cursor = None
             self._popup_click = None     # [x, y, ticks left]: tap on a menu, cursor moved first
+            self._gesture_view = None    # (rv3d, view state) when this touch began moving it
             self._touching = False
             self._raw_block = False      # 3+ fingers on the glass: ignore pointer gestures
             self._raw_last = None        # (finished raw touch, perf_counter when finished)
@@ -2562,6 +2719,8 @@ if bpy is not None:
                 _PENDING_REPORT[0] = None
 
             eng = self._engine
+            cancel_cm = float(context.scene.multitouch_props.cancel_range)
+            eng.cancel_px = cancel_cm * self._px_per_cm if cancel_cm > 0.0 else -1.0
             t_tick = time.perf_counter()
             raw = self._hook.raw
             if raw.emit and raw.pending_up:
@@ -2663,6 +2822,15 @@ if bpy is not None:
             if (self._ctl is not None and self._ctl.kind == 'NUMDRAG'
                     and not eng.touches):
                 self._end_controller()   # never leave the button or Ctrl held
+            if self._gesture_view is not None and not eng.touches:
+                rv3d, st = self._gesture_view
+                self._gesture_view = None
+                try:
+                    if not _view_same(st, _view_state(rv3d)):
+                        _VIEW_HISTORY.append((rv3d, st))
+                        del _VIEW_HISTORY[:-_VIEW_HISTORY_MAX]
+                except Exception:
+                    pass
             # Touch mode
             if not eng.touches:
                 quiet = t_tick - self._tui_last_touch
@@ -2744,7 +2912,7 @@ if bpy is not None:
                 if n >= 3 and dur <= self._RAW_TAP_MAX_S and mv <= self._RAW_TAP_MAX_MOVE:
                     self._pending_tap = None
                     x, y = self._last_touch or (0, 0)
-                    self._apply(context, ('multi_tap', min(n, 4), x, y))
+                    self._apply(context, ('multi_tap', min(n, 5), x, y))
             if self._raw_block and raw.gesture is None and not self._hook.down_ids:
                 if self._engine.mode == NONE or now - raw.last_t > 1.0:
                     self._engine.reset()
@@ -3004,8 +3172,23 @@ if bpy is not None:
                 if kind == 'hold_drag':
                     dx, dy, x, y = a[1:]
                     he.move(x - dx, y - dy, x, y)
+                elif kind == 'hold_two_begin':
+                    self._hold_lock = (GestureLock(4.0 * self._engine.threshold, a[1:3])
+                                       if context.scene.multitouch_props.one_action else None)
                 elif kind == 'hold_two':
-                    he.two(*a[1:])
+                    dx, dy, zoom, dang, cx, cy = a[1:]
+                    lk = getattr(self, "_hold_lock", None)
+                    if lk is not None:
+                        act = lk.feed(dx, dy, zoom, dang, self._engine.prev_dist)
+                        if act is None:
+                            return
+                        if act != 'PAN':
+                            dx = dy = 0.0
+                        if act != 'ZOOM':
+                            zoom = 1.0
+                        if act != 'TWIST':
+                            dang = 0.0
+                    he.two(dx, dy, zoom, dang, cx, cy)
                 if kind in ('hold_drag', 'hold_two') and he.status():
                     self._hold_header(he.status())
                 elif kind == 'hold_cancel':
@@ -3026,6 +3209,8 @@ if bpy is not None:
                     region = next((r for r in area.regions if r.type == 'WINDOW'), region)
                 rv3d = area.spaces.active.region_3d
             ctl = _Controller(kind, area, region, rv3d, window)
+            if kind == 'VIEW3D' and self._gesture_view is None:
+                self._gesture_view = (rv3d, _view_state(rv3d))
             if kind == 'MOUSE':
                 ctl.button = 'LEFT'
             elif kind == 'PAN2D':
@@ -3140,7 +3325,7 @@ if bpy is not None:
                         self._restore_cursor = rest
                         _log("BUSY: 2-finger tap -> cancel")
                     return
-                if kind in ('two_begin', 'two', 'twist', 'two_to_one'):
+                if kind in ('two_begin', 'two', 'twist', 'two_to_one', 'five_hold'):
                     return
                 if kind == 'tap':
                     self._end_controller()
@@ -3235,7 +3420,7 @@ if bpy is not None:
                         ctl.last_xy = (sx, sy)
                         self._ctl = ctl
                     return
-                mode = classify_one_finger(context, target, props.scroll_fingers == 'ONE')
+                mode = classify_one_finger(context, target, True)   # 1 or 2 fingers scroll
                 _w, area, region, (rx, ry), _l = target
                 if (mode == 'MOUSE' and area.type == 'VIEW_3D' and region.type == 'WINDOW'
                         and context.mode in _PAINT_MODES
@@ -3322,6 +3507,8 @@ if bpy is not None:
                     ctl.decided = True    # number dragging is for one-finger drags only
                 if ctl is not None and ctl.kind == 'VIEW3D':
                     ctl.anchor = self._surface_under(context, ctl, cx, cy)
+                    if props.one_action:
+                        ctl.lock = GestureLock(4.0 * self._engine.threshold, (cx, cy))
 
             elif kind == 'two':
                 ctl = self._ctl
@@ -3335,6 +3522,15 @@ if bpy is not None:
                         numdrag_move(ctl, p[0] - ctl.fxy[0], p[1] - ctl.fxy[1])
                     ctl.fxy = p
                     return
+                if ctl.kind == 'VIEW3D' and ctl.lock is not None:
+                    act = ctl.lock.feed(dx, dy, zoom, 0.0, self._engine.prev_dist)
+                    if act not in ('PAN', 'ZOOM'):
+                        return            # undecided, or twisting: no pan / zoom
+                    if act == 'PAN':
+                        zoom = 1.0
+                    else:
+                        dx = dy = 0.0
+                        cx, cy = ctl.lock.start   # zoom around where the fingers began
                 if ctl.kind == 'VIEW3D':
                     zoom = max(zoom, 1e-3) ** props.zoom_speed   # 1.0 = distance follows the pinch 1:1
                     rv3d, region = ctl.rv3d, ctl.region
@@ -3364,6 +3560,10 @@ if bpy is not None:
                         or not props.twist_roll):
                     return
                 dang = a[1]
+                if ctl.lock is not None:
+                    if ctl.lock.feed(0.0, 0.0, 1.0, dang, self._engine.prev_dist) != 'TWIST':
+                        return
+                    ctl.twist = TWIST_START_RAD     # chosen on purpose: no extra threshold
                 if abs(ctl.twist) < TWIST_START_RAD:
                     ctl.twist += dang       # pinches wobble a little: roll only on a real twist
                     if abs(ctl.twist) < TWIST_START_RAD:
@@ -3392,6 +3592,28 @@ if bpy is not None:
                     inject_button(ctl.button, True, x, y)
                 ctl.last_xy = (x, y)
 
+            elif kind == 'five_hold':
+                self._end_controller()
+                x, y = int(a[1]), int(a[2])
+                inject_move(x, y)        # the pie opens at the cursor: under the hand
+                bpy.app.timers.register(lambda: _run_five(('PIE', x, y)), first_interval=0.05)
+
+            elif kind == 'cancel':
+                ctl = self._ctl
+                in_view = ctl is not None and ctl.kind == 'VIEW3D'
+                tgt = find_target(context, a[1], a[2]) if in_view else None
+                in_view = (tgt is not None and tgt[1].type == 'VIEW_3D'
+                           and tgt[2].type == 'WINDOW')
+                self._end_controller()
+                gv = self._gesture_view
+                self._gesture_view = None
+                if gv is not None and in_view:
+                    try:
+                        _view_restore(*gv)
+                        _log_info("touch: view move cancelled (extra finger)")
+                    except Exception:
+                        pass
+
             elif kind == 'end':
                 ctl = self._ctl
                 if (ctl is not None and ctl.kind == 'NUMDRAG'
@@ -3402,11 +3624,41 @@ if bpy is not None:
             elif kind == 'multi_tap':
                 self._end_controller()
                 n, cx, cy = a[1], a[2], a[3]
-                action = {2: props.tap2_action, 3: props.tap3_action, 4: props.tap4_action}.get(n, 'NONE')
+                action = {2: props.tap2_action, 3: props.tap3_action, 4: props.tap4_action,
+                          5: props.tap5_action}.get(n, 'NONE')
                 if action != 'NONE':
                     # Never undo from inside the modal handler: defer to a timer.
                     bpy.app.timers.register(
                         lambda: _run_tap_action(action, cx, cy), first_interval=0.0)
+
+    class VIEW3D_OT_multitouch_previous_view(bpy.types.Operator):
+        """Back to the view before the last touch move"""
+        bl_idname = "view3d.multitouch_previous_view"
+        bl_label = "Previous View"
+
+        def execute(self, context):
+            return _view_back()
+
+    class VIEW3D_MT_multitouch_pie(bpy.types.Menu):
+        bl_label = "Touch"
+
+        def draw(self, context):
+            pie = self.layout.menu_pie()
+            # Pie order: left, right, bottom, top, top-left, top-right, bottom-left, bottom-right
+            pie.operator("ed.undo", text="Undo", icon='LOOP_BACK')
+            pie.operator("ed.redo", text="Redo", icon='LOOP_FORWARDS')
+            pie.operator("view3d.multitouch_previous_view", icon='VIEW_CAMERA')
+            op = pie.operator("wm.call_menu_pie", text="Mode", icon='OBJECT_DATAMODE')
+            op.name = "VIEW3D_MT_object_mode_pie"
+            pie.operator("screen.screen_full_area", text="Focus Mode",
+                         icon='FULLSCREEN_ENTER').use_hide_panels = True
+            ap = _tui_prefs()
+            if ap is not None:
+                pie.prop(ap, "touch_ui", text="Bigger UI")
+            else:
+                pie.separator()
+            pie.prop(context.scene.multitouch_props, "palm_reject", text="Palm Rejection")
+            pie.operator("view3d.view_selected", text="Frame Selected", icon='ZOOM_SELECTED')
 
     class VIEW3D_OT_multitouch_stop(bpy.types.Operator):
         bl_idname = "view3d.multitouch_stop"
@@ -3422,15 +3674,6 @@ if bpy is not None:
             description="Write gesture diagnostics to multitouch_debug.log in your home folder",
             default=False,
             update=lambda self, ctx: _LOG_ENABLED.__setitem__(0, self.diag_log),
-        )
-        scroll_fingers: bpy.props.EnumProperty(
-            name="Scroll With",
-            description="How lists, panels and sidebars scroll",
-            items=[
-                ('ONE', "1 or 2 Fingers", "One-finger drag scrolls lists and panels (two fingers also scroll)"),
-                ('TWO', "2 Fingers", "Only two fingers scroll; one-finger drag acts like a mouse drag (sliders, box select)"),
-            ],
-            default='ONE',
         )
         pen_only_paint: bpy.props.BoolProperty(
             name="Pen-Only Painting",
@@ -3486,15 +3729,32 @@ if bpy is not None:
                         "the finger spread exactly, lower = slower)",
             default=0.75, min=0.1, max=1.5, step=5, precision=2,
         )
+        one_action: bpy.props.BoolProperty(
+            name="One Action at a Time",
+            description="Two-finger gestures do only one thing until you lift: slide (pan), "
+                        "pinch (zoom) or twist (roll), whichever you start with. Also for "
+                        "objects moved with a hold: roll, scale or spin",
+            default=False,
+        )
         twist_roll: bpy.props.BoolProperty(
             name="Twist to Roll",
             description="Twisting two fingers rolls the 3D View (turns it clockwise / "
                         "counter-clockwise on screen)",
             default=True,
         )
+        cancel_range: bpy.props.EnumProperty(
+            name="Cancel Finger Range",
+            description="While two fingers move the 3D View, a third finger put down this "
+                        "close to them snaps the view back to where it was. Farther touches "
+                        "(an arm, the other hand) are ignored",
+            items=[('0', "Off", "Never cancel: third touches are ignored")]
+                  + [(str(c), "%d cm" % c, "") for c in (1, 2, 3, 4, 5, 6, 8, 10, 15)],
+            default='4',
+        )
         tap2_action: bpy.props.EnumProperty(name="2-Finger Tap", items=_TAP_ACTIONS, default='UNDO')
         tap3_action: bpy.props.EnumProperty(name="3-Finger Tap", items=_TAP_ACTIONS, default='REDO')
         tap4_action: bpy.props.EnumProperty(name="4-Finger Tap", items=_TAP_ACTIONS, default='FOCUS')
+        tap5_action: bpy.props.EnumProperty(name="5-Finger Tap", items=_TAP_ACTIONS, default='NONE')
 
     class VIEW3D_PT_multitouch(bpy.types.Panel):
         bl_label = "Multitouch"
@@ -3543,6 +3803,8 @@ if bpy is not None:
             col.prop(props, "tap2_action", text="2 Fingers")
             col.prop(props, "tap3_action", text="3 Fingers")
             col.prop(props, "tap4_action", text="4 Fingers")
+            col.prop(props, "tap5_action", text="5 Fingers")
+            layout.prop(props, "cancel_range", text="Cancel Finger")
 
             layout.separator()
             layout.label(text="Touch Input (restart to apply):")
@@ -3556,7 +3818,7 @@ if bpy is not None:
                     layout.label(text="Raw unavailable: using Windows", icon='INFO')
             layout.prop(props, "zoom_speed", slider=True)
             layout.prop(props, "twist_roll")
-            layout.prop(props, "scroll_fingers", expand=True)
+            layout.prop(props, "one_action")
             layout.prop(props, "pen_only_paint")
             box = layout.box()
             box.prop(props, "palm_reject")
@@ -3580,6 +3842,8 @@ if bpy is not None:
         MultitouchProps,
         VIEW3D_OT_multitouch_navigate,
         VIEW3D_OT_multitouch_stop,
+        VIEW3D_OT_multitouch_previous_view,
+        VIEW3D_MT_multitouch_pie,
         VIEW3D_PT_multitouch,
     )
 
