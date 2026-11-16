@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 id = "multitouch_viewport"
 # Kept in step with bl_info["version"] by build_extension.py
-version = "3.28.0"
+version = "3.29.0"
 name = "Multitouch Viewport Navigation"
 tagline = "Touchscreen navigation and pen palm rejection on Windows"
 maintainer = "EmaMcdon"

@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 28, 0),
+    "version": (3, 29, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -1745,6 +1745,37 @@ def _tui_prefs():
         return None
 
 
+# Blender draws viewport dots and lines (vertices, edges, outlines, wire) times a whole
+# "pixel size" = max(1, dpi // 64) + Line Width (Thin -1 / Auto 0 / Thick +1). A bigger
+# UI scale can push that from 1 to 2 and double everything in the 3D view at once. While
+# the touch UI is bigger, Line Width is set so that pixel size stays what it was.
+_LINE_WIDTHS = ('THIN', 'AUTO', 'THICK')
+
+
+def _line_width_hold(ap, target_scale):
+    v = bpy.context.preferences.view
+    try:
+        sysp = bpy.context.preferences.system
+        base_px = int(sysp.pixel_size)
+        dpi = float(sysp.dpi) * target_scale / max(v.ui_scale, 0.1)
+        auto_px = max(1, int(dpi) // 64)
+        o = max(-1, min(1, base_px - auto_px))
+        want = _LINE_WIDTHS[o + 1]
+        if v.ui_line_width != want:
+            v.ui_line_width = want
+    except Exception:
+        pass
+
+
+def _line_width_restore(ap):
+    try:
+        v = bpy.context.preferences.view
+        if v.ui_line_width != ap.base_line_width:
+            v.ui_line_width = ap.base_line_width
+    except Exception:
+        pass
+
+
 def tui_enter():
     ap = _tui_prefs()
     if ap is None or _TUI["active"] or not ap.touch_ui:
@@ -1753,10 +1784,13 @@ def tui_enter():
     if not ap.touch_ui_active:
         ap.base_ui_scale = v.ui_scale
         ap.base_tooltips = v.show_tooltips
+        ap.base_line_width = v.ui_line_width
         ap.touch_ui_active = True
     _TUI["active"] = True
     v.show_tooltips = False
     target = max(0.5, min(4.0, ap.base_ui_scale * ap.touch_ui_scale))
+    if v.ui_line_width == ap.base_line_width:
+        _line_width_hold(ap, target)       # measured at the user's own size
     _TUI["anim"] = (v.ui_scale, target, time.perf_counter(), False)
     _log_info("touch mode on: UI scale %.2f -> %.2f" % (v.ui_scale, target))
 
@@ -1772,6 +1806,7 @@ def tui_exit(immediate=False):
     if immediate:
         _TUI["anim"] = None
         v.ui_scale = ap.base_ui_scale
+        _line_width_restore(ap)
         ap.touch_ui_active = False
     else:
         _TUI["anim"] = (v.ui_scale, ap.base_ui_scale, time.perf_counter(), True)
@@ -1798,6 +1833,7 @@ def tui_tick(now):
         if finish:
             ap = _tui_prefs()
             if ap is not None:
+                _line_width_restore(ap)
                 ap.touch_ui_active = False
 
 
@@ -1861,31 +1897,40 @@ def markers_shrink(force=False):
 
 
 def markers_tick(now):
-    an = _MARK["anim"]
-    if an is None or _THEME_BACKUP[0] is not None:
-        return       # nothing to do, or a hold glow is showing: carry on after it
+    """Animate the bigger selection dots (grow on a viewport touch, shrink later)."""
+    if _THEME_BACKUP[0] is not None:
+        return       # a hold glow is showing: carry on after it
     ap = _tui_prefs()
-    if ap is None or not ap.touch_markers_active:
-        _MARK["anim"] = None
+    if ap is None:
         return
-    p0, p1, t0 = an
-    f = max(0.0, min(1.0, (now - t0) / MARKERS_ANIM_S))
-    f = f * f * (3.0 - 2.0 * f)                      # ease in and out
-    p = p0 + (p1 - p0) * f
-    _MARK["p"] = p
+    scaled = False
+    an = _MARK["anim"]
+    if an is None and not scaled and not ap.touch_markers_active:
+        return
     try:
         th = bpy.context.preferences.themes[0].view_3d
-        new = _markers_sizes(tuple(ap.base_markers), p)
+        if not ap.touch_markers_active:
+            ap.base_markers = (th.outline_width, th.vertex_size, th.edge_width,
+                               th.facedot_size)
+            ap.touch_markers_active = True
+            _MARK["p"] = 0.0
+        if an is not None:
+            p0, p1, t0 = an
+            f = max(0.0, min(1.0, (now - t0) / MARKERS_ANIM_S))
+            f = f * f * (3.0 - 2.0 * f)                  # ease in and out
+            _MARK["p"] = p0 + (p1 - p0) * f
+            if f >= 1.0:
+                _MARK["p"] = p1
+                _MARK["anim"] = None
+        base = tuple(ap.base_markers)
+        new = _markers_sizes(base, _MARK["p"])
         if (th.outline_width, th.vertex_size, th.edge_width, th.facedot_size) != new:
             th.outline_width, th.vertex_size, th.edge_width, th.facedot_size = new
             _redraw_3d_views()
+        if _MARK["anim"] is None and _MARK["p"] == 0.0 and not scaled:
+            ap.touch_markers_active = False      # back to the user's own sizes
     except Exception:
         pass
-    if f >= 1.0:
-        _MARK["p"] = p1
-        _MARK["anim"] = None
-        if p1 == 0.0:
-            ap.touch_markers_active = False
 
 
 def tui_restore_saved():
@@ -1896,6 +1941,7 @@ def tui_restore_saved():
             v = bpy.context.preferences.view
             v.ui_scale = ap.base_ui_scale
             v.show_tooltips = ap.base_tooltips
+            _line_width_restore(ap)
             ap.touch_ui_active = False
             _log_info("restored UI scale %.2f after touch mode" % ap.base_ui_scale)
         except Exception:
@@ -3380,7 +3426,12 @@ if bpy is not None:
             """First finger down. On the interface: grow it now. On the viewport (or
             another editor's canvas): back to the normal size."""
             self._anchor = None
-            markers_grow()
+            # Bigger selection dots only when the finger is on the 3D view itself, where
+            # it picks things; touching panels, menus or headers leaves them alone.
+            vt = find_target(context, x, y)
+            if (vt is not None and vt[1].type == 'VIEW_3D' and vt[2].type == 'WINDOW'
+                    and popup_under(context, x, y) is None):
+                markers_grow()
             ap = _tui_prefs()
             if ap is None or not ap.touch_ui:
                 return
@@ -4413,6 +4464,7 @@ if bpy is not None:
         touch_ui_active: bpy.props.BoolProperty(default=False, options={'HIDDEN'})
         base_ui_scale: bpy.props.FloatProperty(default=1.0, options={'HIDDEN'})
         base_tooltips: bpy.props.BoolProperty(default=True, options={'HIDDEN'})
+        base_line_width: bpy.props.StringProperty(default='AUTO', options={'HIDDEN'})
 
         def draw(self, context):
             self.layout.prop(self, "auto_start")
