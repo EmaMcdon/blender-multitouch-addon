@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 29, 0),
+    "version": (3, 29, 3),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -357,11 +357,18 @@ class PalmFilter:
     Touches the screen itself marks as palms (HID Confidence off) are always rejected.
     A touch that landed shortly before the pen came into range (palm first, pen after)
     is cancelled when the pen arrives. A rejected touch stays rejected until it lifts.
+    Sticky: an arm / palm on the glass splits into new contacts as it shifts, also after
+    the pen has lifted. A new touch near a rejected one that is still down (or lifted
+    a moment ago) is the same palm, and is rejected too.
     """
     PALM_FIRST_S = 0.3
+    STICKY_AFTER_S = 0.5
+    LIFT_WITH_PEN_S = 0.5      # an arm comes off a little after the pen
 
     def __init__(self):
         self.rejected = set()
+        self.rej_pos = {}         # pid -> [x, y] of rejected touches still down
+        self.rej_gone = []        # (x, y, t_up) of rejected touches that just lifted
         self.live = {}            # pid -> [x, y, t_down] of touches passed on
         self._enter_seen = 0.0
         self.count = 0            # rejected touches (for the log)
@@ -390,9 +397,18 @@ class PalmFilter:
             self.details.append("%s at (%d,%d) pen (%d,%d) %s" % (
                 why, x, y, pen["x"], pen["y"], "in range" if pen["in"] else "left"))
 
+    def _near_palm(self, x, y, t, gap_px):
+        r = max(gap_px, 1.0)
+        self.rej_gone = [g for g in self.rej_gone if t - g[2] < self.STICKY_AFTER_S]
+        for px, py in list(self.rej_pos.values()) + [(g[0], g[1]) for g in self.rej_gone]:
+            if math.hypot(x - px, y - py) <= r:
+                return True
+        return False
+
     def _cancel(self, pid, out, t, why="cancel", pen=None):
         x, y, _t0 = self.live.pop(pid)
         self.rejected.add(pid)
+        self.rej_pos[pid] = [x, y]
         if pen is not None:
             self._note(why, x, y, pen)
         else:
@@ -401,12 +417,12 @@ class PalmFilter:
 
     def filter(self, events, pen, palms, zone, gap_px, grace_s, now):
         out = []
-        # The pen just came into range: cancel touches that landed just before it, on
-        # the pen hand's side (the palm usually lands first).
+        # The pen just came into range: cancel touches resting on the pen hand's side,
+        # however long ago they landed (the arm / palm usually lands first).
         if pen["in"] and pen["enter_t"] > self._enter_seen:
             self._enter_seen = pen["enter_t"]
             for pid, (x, y, t0) in list(self.live.items()):
-                if t0 >= pen["enter_t"] - self.PALM_FIRST_S and not self.free(pen, x, y, zone, gap_px):
+                if not self.free(pen, x, y, zone, gap_px):
                     self._cancel(pid, out, now, "palm-first", pen)
         # The screen flagged an ongoing touch as a palm.
         for pid in [q for q in self.live if q in palms]:
@@ -417,13 +433,22 @@ class PalmFilter:
                 if is_up:
                     self.rejected.discard(pid)
                     palms.discard(pid)
+                    self.rej_pos.pop(pid, None)
+                    self.rej_gone.append((x, y, t))
+                else:
+                    self.rej_pos[pid] = [x, y]
                 continue
             if is_down:
-                if pid in palms or (self.pen_active(pen, t, grace_s)
-                                    and not self.free(pen, x, y, zone, gap_px)):
-                    self._note("screen palm" if pid in palms else "near pen", x, y, pen)
+                near_palm = self._near_palm(x, y, t, gap_px)
+                if pid in palms or near_palm or (self.pen_active(pen, t, grace_s)
+                                                 and not self.free(pen, x, y, zone, gap_px)):
+                    self._note("screen palm" if pid in palms else
+                               ("next to palm" if near_palm else "near pen"), x, y, pen)
                     if not is_up:
                         self.rejected.add(pid)
+                        self.rej_pos[pid] = [x, y]
+                    else:
+                        self.rej_gone.append((x, y, t))
                     continue
                 self.live[pid] = [x, y, t]
                 if self.pen_active(pen, t, grace_s) and len(self.allowed) < 6:
@@ -431,6 +456,13 @@ class PalmFilter:
             elif is_up:
                 self.live.pop(pid, None)
                 palms.discard(pid)
+                if (not canceled and self.pen_active(pen, t, max(grace_s, self.LIFT_WITH_PEN_S))
+                        and not self.free(pen, x, y, zone, gap_px)):
+                    # Lifted together with the pen (arm / palm): never a tap or a click,
+                    # which would draw a dot with Annotate or a stroke in sculpt / paint.
+                    self._note("lifted with pen", x, y, pen)
+                    out.append((pid, x, y, False, True, True, t))
+                    continue
             elif pid in palms and pid in self.live:
                 self._cancel(pid, out, t, "screen palm", pen)
                 continue
@@ -441,6 +473,8 @@ class PalmFilter:
 
     def reset(self):
         self.rejected.clear()
+        self.rej_pos.clear()
+        self.rej_gone = []
         self.live.clear()
 
 
@@ -1665,6 +1699,22 @@ _MOUSE_REGIONS = {'HEADER', 'TOOL_HEADER', 'FOOTER', 'NAVIGATION_BAR', 'EXECUTE'
 _PAINT_MODES = {'SCULPT', 'SCULPT_CURVES', 'PAINT_TEXTURE', 'PAINT_VERTEX', 'PAINT_WEIGHT',
                 'PAINT_GPENCIL', 'PAINT_GREASE_PENCIL', 'SCULPT_GPENCIL', 'SCULPT_GREASE_PENCIL',
                 'WEIGHT_GPENCIL', 'WEIGHT_GREASE_PENCIL', 'VERTEX_GPENCIL', 'VERTEX_GREASE_PENCIL'}
+
+
+def touch_never_draws(context):
+    """Sculpt / paint modes, or a drawing tool (Annotate, Annotate Line / Polygon /
+    Eraser) in any mode: a finger never clicks or drags in the viewport there, since
+    that would draw. Drawing is the pen's job."""
+    if context.mode in _PAINT_MODES:
+        return True
+    try:
+        t = context.workspace.tools.from_space_view3d_mode(context.mode, create=False)
+        return t is not None and t.idname.startswith("builtin.annotate")
+    except Exception:
+        return False
+
+
+MENU_TAP_WINDOW_S = 8.0   # after a menu key, a tap over the viewport may be for that menu
 
 
 _EVENT_VK = {'ZERO': 0x30, 'ONE': 0x31, 'TWO': 0x32, 'THREE': 0x33, 'FOUR': 0x34,
@@ -3889,10 +3939,10 @@ if bpy is not None:
                     return
                 _w, area, region, (rx, ry), _l = target
                 if (area.type == 'VIEW_3D' and region.type == 'WINDOW'
-                        and context.mode in _PAINT_MODES
+                        and touch_never_draws(context)
                         and not _over_navigation_gizmo(area, region, rx, ry)):
                     menu = self._hook.menu
-                    if not (menu["t"] and time.perf_counter() - menu["t"] < 120.0):
+                    if not (menu["t"] and time.perf_counter() - menu["t"] < MENU_TAP_WINDOW_S):
                         return  # touch never sculpts or paints; that's the pen's job
                     # A pie / menu opened by a key is over the viewport: this tap is for it.
                     menu["t"] = 0.0
@@ -3937,7 +3987,7 @@ if bpy is not None:
                 mode = classify_one_finger(context, target, True)   # 1 or 2 fingers scroll
                 _w, area, region, (rx, ry), _l = target
                 if (mode == 'MOUSE' and area.type == 'VIEW_3D' and region.type == 'WINDOW'
-                        and context.mode in _PAINT_MODES
+                        and touch_never_draws(context)
                         and not _over_navigation_gizmo(area, region, rx, ry)):
                     mode = 'VIEW3D'   # never a left-button drag (= a stroke) in paint modes
                 self._begin_controller(context, mode, target, sx, sy)
