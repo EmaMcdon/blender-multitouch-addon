@@ -7,7 +7,7 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 ## Features
 
 - **Touch navigation**: tap to click, one-finger orbit/pan/scroll, two-finger pan and pinch zoom, two-finger twist to roll the view (can be turned off: *Twist to Roll*).
-- **Multi-finger taps**: 2, 3, 4 and 5 fingers, each set to Undo, Redo, Focus Mode, Maximize Area or Previous View.
+- **Multi-finger taps**: 2, 3, 4 and 5 fingers, each set to Right Click, Undo, Redo, Focus Mode, Maximize Area or Previous View. A 2-finger tap right-clicks by default.
 - **5-finger hold**: opens a touch pie (Mode, Undo, Redo, Previous View, Focus Mode, Bigger UI, Palm Rejection, Frame Selected).
 - **Cancel a view move**: while two fingers move the view, put a third finger down near them (*Cancel Finger*, default 4 cm) and the view snaps back. Touches farther away, like your arm, are ignored.
 - **One Action at a Time** (optional): a two-finger gesture only pans, zooms or rolls, whichever you start with.
@@ -15,6 +15,8 @@ Tested with Blender 5.3 on Windows 11 with a Huion pen display.
 - **Edit Mode by touch**: hold a vertex, edge or face to grab it (whichever the select mode picks), or hold part of an existing selection to move all of it. With Blender's snapping on, the hold runs Blender's own move (G) steered by the finger, so Face Project and other snap targets work as with the mouse.
 - **Loop Cut and Knife by touch**: while Loop Cut (Ctrl+R), Knife, Poly Build, Bisect or Offset Edge Loops runs, sliding a finger hovers (shows the preview) and a tap clicks right there.
 - **Bigger selection dots**: vertex and face dots, edges and object outlines grow smoothly while you use touch, and shrink back after 5 seconds without a finger or when you use the mouse or pen.
+- **Pinch zoom in 2D editors**: two fingers pan and pinch-zoom the Node, Image / UV and Sequencer editors, keeping the point between the fingers in place.
+- **Scroll headers sideways**: hold a header or the tool settings bar until the ring fills, then slide left or right to reach settings that don't fit.
 - **Palm rejection**: touches on the pen hand's side are ignored while the pen is near and for a set time after it leaves. Right-handed, left-handed and distance modes are available.
 - **Auto-perspective**: one-finger orbit leaves the automatic orthographic view (orthographic chosen with numpad 5 is kept).
 - **Number fields by touch**: drag sideways on a value to change it like a mouse, with the touch point as zero. Add a second finger for Ctrl (snap).

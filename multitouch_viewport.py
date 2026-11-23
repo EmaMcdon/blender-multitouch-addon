@@ -4,7 +4,7 @@
 bl_info = {
     "name": "Multitouch Viewport Navigation",
     "author": "Claude",
-    "version": (3, 29, 3),
+    "version": (3, 30, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Touch",
     "description": "Touch navigation modelled on Blender's Android demo build: tap to click, "
@@ -865,15 +865,28 @@ _OVERLAP = {}          # region pointer -> (lowest drawn y, region height)
 _OVERLAP_HANDLES = []
 
 
+_OVERLAP_T = {}       # region pointer -> (perf time, w, h) of the last read
+OVERLAP_READ_S = 1.0  # at most one read per region per second: a GPU read-back makes
+                      # the frame wait, and these regions redraw every frame while the
+                      # view moves (middle-mouse orbit would stutter / freeze)
+
+
 def _overlap_draw():
     try:
         reg = bpy.context.region
         if reg is None or reg.type not in ('UI', 'TOOLS'):
             return
-        import gpu
         h = int(reg.height)
         if h < 2:
             return
+        key = reg.as_pointer()
+        now = time.perf_counter()
+        last = _OVERLAP_T.get(key)
+        if (last is not None and now - last[0] < OVERLAP_READ_S
+                and last[1] == reg.width and last[2] == h):
+            return
+        _OVERLAP_T[key] = (now, reg.width, h)
+        import gpu
         buf = gpu.state.active_framebuffer_get().read_color(int(reg.width) // 2, 0, 1, h, 4, 0,
                                                              'FLOAT')
         buf.dimensions = h * 4
@@ -905,6 +918,7 @@ def _overlap_unregister():
         except Exception:
             pass
     _OVERLAP.clear()
+    _OVERLAP_T.clear()
 
 
 def _see_through(area, region, ry):
@@ -1689,6 +1703,7 @@ def _over_node(area, region, rx, ry):
     return False
 
 
+_HSCROLL_REGIONS = {'HEADER', 'TOOL_HEADER', 'FOOTER'}
 _SCROLL_SPACES = {'OUTLINER', 'PROPERTIES', 'PREFERENCES', 'FILE_BROWSER',
                   'TEXT_EDITOR', 'CONSOLE', 'INFO', 'SPREADSHEET'}
 _PAN2D_SPACES = {'NODE_EDITOR', 'IMAGE_EDITOR', 'CLIP_EDITOR', 'SEQUENCE_EDITOR',
@@ -2167,13 +2182,79 @@ def classify_one_finger(context, target, scroll_one_finger):
     return 'MOUSE'
 
 
+# Two fingers pan and pinch-zoom these editors (Blender's own view operators).
+_ZOOM2D_SPACES = {'NODE_EDITOR', 'IMAGE_EDITOR', 'SEQUENCE_EDITOR'}
+
+
 def classify_two_finger(target):
     window, area, region, _r, _l = target
     if area.type == 'VIEW_3D' and region.type in ('WINDOW', 'HEADER', 'TOOL_HEADER'):
         return 'VIEW3D'           # orbit/pan gestures work under overlapping regions too
+    if area.type in _ZOOM2D_SPACES and region.type in ('WINDOW', 'PREVIEW'):
+        return 'ZOOM2D'
     if area.type in _PAN2D_SPACES and region.type in ('WINDOW', 'PREVIEW'):
         return 'PAN2D'
     return 'SCROLL'
+
+
+def _view2d_span(region):
+    v0 = region.view2d.region_to_view(0, 0)
+    v1 = region.view2d.region_to_view(region.width, 0)
+    return abs(v1[0] - v0[0])
+
+
+def view2d_pan_zoom(ctl, dx, dy, zoom, cx, cy):
+    """Two-finger pan + pinch in a 2D editor: zoom by `zoom` keeping the point between
+    the fingers (cx, cy, screen) in place, then follow the fingers by (dx, dy) px."""
+    area, region, win = ctl.area, ctl.region, ctl.window
+    lx, ly = _screen_to_local(win, cx, cy)
+    ox = (lx - region.x) - region.width * 0.5      # from the region centre, y up
+    oy = (ly - region.y) - region.height * 0.5
+    if ctl.acc is None:
+        ctl.acc = [0.0, 0.0]
+    try:
+        with bpy.context.temp_override(window=win, screen=win.screen, area=area,
+                                       region=region):
+            if area.type == 'IMAGE_EDITOR':
+                sp = area.spaces.active
+                if ctl.anchor is None:
+                    ctl.anchor = float(sp.zoom[0])    # zoom as we track it (sp.zoom only
+                k = 1.0                               # updates when the editor redraws)
+                if abs(zoom - 1.0) > 1e-4:
+                    bpy.ops.image.view_zoom(factor=zoom)
+                    k = zoom
+                    ctl.anchor *= zoom
+                z1 = max(ctl.anchor, 1e-6)
+                off = ((-dx + ox * (k - 1.0)) / z1, (dy + oy * (k - 1.0)) / z1)
+                if off[0] or off[1]:
+                    bpy.ops.image.view_pan(offset=off)
+            else:
+                k = 1.0
+                if abs(zoom - 1.0) > 1e-4:
+                    w0 = _view2d_span(region)
+                    # zoom_in narrows the view to width * (1 - 2 fac); a negative fac
+                    # widens it (zoom_out narrows too, measured, so it isn't used).
+                    # Ask for what the fingers want plus what earlier steps fell short of
+                    # (the editor's zoom steps aren't exact): the zoom keeps up with them.
+                    want = zoom * math.exp(ctl.wheel)
+                    fac = max(-2.0, min(0.45, (1.0 - 1.0 / want) * 0.5))
+                    bpy.ops.view2d.zoom_in(zoomfacx=fac, zoomfacy=fac)
+                    w1 = _view2d_span(region)
+                    if w1 > 1e-9:
+                        k = w0 / w1
+                    if k > 1e-6:
+                        ctl.wheel = max(-1.0, min(1.0, math.log(want) - math.log(k)))
+                ctl.acc[0] += -dx + ox * (k - 1.0)
+                ctl.acc[1] += dy + oy * (k - 1.0)
+                ix, iy = int(round(ctl.acc[0])), int(round(ctl.acc[1]))
+                if ix or iy:
+                    ctl.acc[0] -= ix
+                    ctl.acc[1] -= iy
+                    bpy.ops.view2d.pan(deltax=ix, deltay=iy)
+        region.tag_redraw()
+    except Exception:
+        import traceback
+        _log_error("2D pinch:\n" + traceback.format_exc())
 
 
 def apply_view3d(rv3d, region, pan_dx, pan_dy, zoom, rot_dx, rot_dy):
@@ -3062,6 +3143,7 @@ _TAP_ACTIONS = [
     ('MAXIMIZE', "Maximize Area", "Toggle maximized area"),
     ('VIEW_BACK', "Previous View", "Back to the view before the last touch move "
                                    "(again for further back)"),
+    ('RIGHT_CLICK', "Right Click", "Right-click where the fingers are (context menus)"),
 ]
 
 
@@ -3231,9 +3313,11 @@ if bpy is not None:
                 pc[2] -= 1
                 if pc[2] <= 0:
                     self._popup_click = None
-                    _log_info("tap click at (%d,%d), cursor (%s)" % (pc[0], pc[1], get_cursor()))
-                    inject_button('LEFT', True, pc[0], pc[1])
-                    inject_button('LEFT', False, pc[0], pc[1])
+                    btn = pc[3] if len(pc) > 3 else 'LEFT'
+                    _log_info("tap %s click at (%d,%d), cursor (%s)"
+                              % (btn.lower(), pc[0], pc[1], get_cursor()))
+                    inject_button(btn, True, pc[0], pc[1])
+                    inject_button(btn, False, pc[0], pc[1])
             events = self._hook.drain()
             if events:
                 self._last_touch = (events[-1][1], events[-1][2])
@@ -3628,6 +3712,35 @@ if bpy is not None:
             if kind in ('hold_end', 'hold_cancel'):
                 self._hold_reset()
 
+        def _hscroll_event(self, context, a, target):
+            kind = a[0]
+            st = getattr(self, "_hscroll", None)
+            if st is None:
+                return
+            if kind == 'hold_progress':
+                _ring_progress(a[1])
+            elif kind == 'hold':
+                st["on"] = True
+                _ring_hide()
+                _log_info("header hold: slide to scroll it")
+            elif kind == 'hold_drag' and st["on"]:
+                st["acc"] += a[1]
+                n = int(st["acc"])
+                if n:
+                    st["acc"] -= n
+                    win, area, region = target[0], target[1], target[2]
+                    try:
+                        with context.temp_override(window=win, screen=win.screen, area=area,
+                                                   region=region):
+                            bpy.ops.view2d.pan(deltax=-n, deltay=0)   # content follows finger
+                        region.tag_redraw()
+                    except Exception:
+                        pass
+            if kind in ('hold_end', 'hold_cancel'):
+                _ring_hide()
+                self._hscroll = None
+                self._hold_reset()
+
         def _hold_header(self, text):
             try:
                 if self._hold_pick is not None:
@@ -3644,6 +3757,19 @@ if bpy is not None:
                 eng.hold_time = HOLD_TIME_S
                 eng.hold_preview = HOLD_PREVIEW_S
                 eng.hold_slop = 1.0
+                if (target is not None and not other_modal_running(context)
+                        and target[2].type in _HSCROLL_REGIONS
+                        and popup_under(context, a[1], a[2]) is None):
+                    # Header / tool settings bar: hold, then slide sideways to scroll it
+                    # (settings that don't fit are hidden past the edge).
+                    self._hold_pick = ('HSCROLL', target)
+                    self._hscroll = {"on": False, "acc": 0.0}
+                    eng.hold_allowed = True
+                    eng.hold_time = UI_HOLD_TIME_S
+                    eng.hold_preview = 0.08
+                    eng.hold_slop = UI_HOLD_SLOP
+                    _ring_show(target, 0.0)
+                    return
                 if (target is not None and not other_modal_running(context)
                         and (_numdrag_region(target[1], target[2])
                              or popup_under(context, a[1], a[2]) is not None)):
@@ -3676,6 +3802,9 @@ if bpy is not None:
             if self._hold_pick is None:
                 return
             pick, target = self._hold_pick
+            if pick == 'HSCROLL':
+                self._hscroll_event(context, a, target)
+                return
             if pick == 'UI':
                 if self._ui_hold is not None:
                     self._ui_hold_event(a)
@@ -4112,8 +4241,11 @@ if bpy is not None:
                         rv3d.view_location = rv3d.view_location + (ctl.anchor - under)
                         rv3d.update()
                     ctl.area.tag_redraw()
+                elif ctl.kind == 'ZOOM2D':
+                    zoom = max(zoom, 1e-3) ** props.zoom_speed
+                    view2d_pan_zoom(ctl, dx, dy, zoom, cx, cy)
                 elif ctl.kind == 'PAN2D':
-                    inject_move(cx, cy)   # pinch only zooms in the 3D View (demo behaviour)
+                    inject_move(cx, cy)
                 else:
                     self._scroll(ctl, dy, cx, cy, dx)
                 ctl.last_xy = (cx, cy)
@@ -4190,7 +4322,11 @@ if bpy is not None:
                 n, cx, cy = a[1], a[2], a[3]
                 action = {2: props.tap2_action, 3: props.tap3_action, 4: props.tap4_action,
                           5: props.tap5_action}.get(n, 'NONE')
-                if action != 'NONE':
+                if action == 'RIGHT_CLICK':
+                    x, y = self._amap(cx, cy)
+                    inject_move(x, y)                  # hover first, click a tick later
+                    self._popup_click = [x, y, 1, 'RIGHT']
+                elif action != 'NONE':
                     # Never undo from inside the modal handler: defer to a timer.
                     bpy.app.timers.register(
                         lambda: _run_tap_action(action, cx, cy), first_interval=0.0)
@@ -4332,7 +4468,8 @@ if bpy is not None:
                   + [(str(c), "%d cm" % c, "") for c in (1, 2, 3, 4, 5, 6, 8, 10, 15)],
             default='4',
         )
-        tap2_action: bpy.props.EnumProperty(name="2-Finger Tap", items=_TAP_ACTIONS, default='UNDO')
+        tap2_action: bpy.props.EnumProperty(name="2-Finger Tap", items=_TAP_ACTIONS,
+                                            default='RIGHT_CLICK')
         tap3_action: bpy.props.EnumProperty(name="3-Finger Tap", items=_TAP_ACTIONS, default='REDO')
         tap4_action: bpy.props.EnumProperty(name="4-Finger Tap", items=_TAP_ACTIONS, default='FOCUS')
         tap5_action: bpy.props.EnumProperty(name="5-Finger Tap", items=_TAP_ACTIONS, default='NONE')
